@@ -8,12 +8,21 @@ use super::super::{
     link_stage::LinkStage,
     scan_stage::{NormalizedScanStageOutput, ScanStage, ScanStageOutput},
   },
-  types::{bundle_output::BundleOutput, scan_stage_cache::ScanStageCache},
+  types::{
+    bundle_output::BundleOutput,
+    module_source_scan::{
+      ModuleSourceScanImport, ModuleSourceScanModule, ModuleSourceScanOutput, ModuleSourceScanSpan,
+    },
+    scan_stage_cache::ScanStageCache,
+  },
   utils::fs_utils::clean_dir,
 };
 use anyhow::Context;
 use arcstr::ArcStr;
-use rolldown_common::{GetLocalDbMut, Module, ScanMode, SharedFileEmitter, SymbolRefDb};
+use oxc_index::IndexVec;
+use rolldown_common::{
+  GetLocalDbMut, HybridIndexVec, Module, ModuleIdx, ScanMode, SharedFileEmitter, SymbolRefDb,
+};
 use rolldown_devtools::{action, trace_action, trace_action_enabled};
 use rolldown_error::{BuildDiagnostic, BuildResult, Severity};
 use rolldown_fs::{FileSystem, OsFileSystem};
@@ -21,6 +30,7 @@ use rolldown_plugin::{
   HookBuildEndArgs, HookCloseBundleArgs, HookRenderErrorArgs, SharedPluginDriver,
 };
 use rolldown_utils::dashmap::FxDashSet;
+use rustc_hash::FxHashMap;
 use std::{path::Path, sync::Arc};
 use sugar_path::SugarPath;
 
@@ -88,6 +98,21 @@ impl<Fs: FileSystem + Clone + 'static> Bundle<Fs> {
   }
 
   #[tracing::instrument(level = "debug", skip_all, parent = &self.bundle_span)]
+  /// This method intentionally get the ownership of `self` to show that the method cannot be called multiple times.
+  pub async fn scan_module_sources(mut self) -> BuildResult<ModuleSourceScanOutput> {
+    let start = self.plugin_driver.start_timing();
+    let result = async {
+      self.trace_action_session_meta();
+      let mut output = self.scan_module_sources_with_mode(ScanMode::Full).await?;
+      output.warnings.append(&mut self.warnings);
+      Ok(output)
+    }
+    .await;
+    self.plugin_driver.set_total_build_time(start);
+    self.append_module_source_scan_plugin_timings_warning(result)
+  }
+
+  #[tracing::instrument(level = "debug", skip_all, parent = &self.bundle_span)]
   pub async fn scan_modules(
     &mut self,
     scan_mode: ScanMode<ArcStr>,
@@ -132,6 +157,46 @@ impl<Fs: FileSystem + Clone + 'static> Bundle<Fs> {
     self.plugin_driver.build_end(None).await?;
     trace_action!(action::BuildEnd { action: "BuildEnd" });
     Ok(scan_stage_output)
+  }
+
+  #[tracing::instrument(level = "debug", skip_all, parent = &self.bundle_span)]
+  async fn scan_module_sources_with_mode(
+    &mut self,
+    scan_mode: ScanMode<ArcStr>,
+  ) -> BuildResult<ModuleSourceScanOutput> {
+    trace_action!(action::BuildStart { action: "BuildStart" });
+
+    let scan_stage_output = match ScanStage::new(
+      Arc::clone(&self.options),
+      Arc::clone(&self.plugin_driver),
+      self.fs.clone(),
+      Arc::clone(&self.resolver),
+    )
+    .scan_module_sources(scan_mode, &mut self.cache)
+    .await
+    {
+      Ok(v) => v,
+      Err(errs) => {
+        debug_assert!(errs.iter().all(|e| e.severity() == Severity::Error));
+        self
+          .plugin_driver
+          .build_end(Some(&HookBuildEndArgs { errors: &errs, cwd: &self.options.cwd }))
+          .await?;
+        self
+          .plugin_driver
+          .close_bundle(Some(&HookCloseBundleArgs { errors: &errs, cwd: &self.options.cwd }))
+          .await?;
+        return Err(errs);
+      }
+    };
+
+    let output = Self::module_source_scan_output(scan_stage_output);
+    std::mem::take(&mut self.cache);
+
+    Self::trace_action_module_source_graph_ready(&output);
+    self.plugin_driver.build_end(None).await?;
+    trace_action!(action::BuildEnd { action: "BuildEnd" });
+    Ok(output)
   }
 
   #[inline]
@@ -333,6 +398,93 @@ impl<Fs: FileSystem + Clone + 'static> Bundle<Fs> {
     }
   }
 
+  fn module_source_scan_output(scan_stage_output: ScanStageOutput) -> ModuleSourceScanOutput {
+    let ScanStageOutput { module_table, warnings, .. } = scan_stage_output;
+    match module_table {
+      HybridIndexVec::IndexVec(module_table) => {
+        Self::module_source_scan_output_from_index_vec(module_table, warnings)
+      }
+      HybridIndexVec::Map(module_table) => {
+        Self::module_source_scan_output_from_map(module_table, warnings)
+      }
+    }
+  }
+
+  fn module_source_scan_output_from_index_vec(
+    module_table: IndexVec<ModuleIdx, Module>,
+    warnings: Vec<BuildDiagnostic>,
+  ) -> ModuleSourceScanOutput {
+    let module_id_by_idx = module_table
+      .iter()
+      .map(|module| module.id().as_arc_str().clone())
+      .collect::<IndexVec<ModuleIdx, ArcStr>>();
+    let mut modules = Vec::with_capacity(module_table.len());
+
+    for module in module_table {
+      if let Some(module) =
+        Self::module_source_scan_module(module, |idx| module_id_by_idx.get(idx).cloned())
+      {
+        modules.push(module);
+      }
+    }
+
+    ModuleSourceScanOutput { modules, warnings }
+  }
+
+  fn module_source_scan_output_from_map(
+    mut module_table: FxHashMap<ModuleIdx, Module>,
+    warnings: Vec<BuildDiagnostic>,
+  ) -> ModuleSourceScanOutput {
+    let module_id_by_idx = module_table
+      .iter()
+      .map(|(idx, module)| (*idx, module.id().as_arc_str().clone()))
+      .collect::<FxHashMap<_, _>>();
+    let mut module_indices = module_table.keys().copied().collect::<Vec<_>>();
+    module_indices.sort_by_key(|idx| idx.index());
+    let mut modules = Vec::with_capacity(module_table.len());
+
+    for idx in module_indices {
+      let module = module_table.remove(&idx).expect("module index collected from module table");
+      if let Some(module) =
+        Self::module_source_scan_module(module, |idx| module_id_by_idx.get(&idx).cloned())
+      {
+        modules.push(module);
+      }
+    }
+
+    ModuleSourceScanOutput { modules, warnings }
+  }
+
+  fn module_source_scan_module(
+    module: Module,
+    module_id_by_idx: impl Fn(ModuleIdx) -> Option<ArcStr>,
+  ) -> Option<ModuleSourceScanModule> {
+    let Module::Normal(module) = module else {
+      return None;
+    };
+    let module = *module;
+    let id = module.id.into_inner();
+    let module_type = module.module_type;
+    let ecma_view = module.ecma_view;
+    let source = ecma_view.source;
+    let exports_kind = ecma_view.exports_kind;
+    let imports = ecma_view
+      .import_records
+      .into_iter()
+      .map(|record| ModuleSourceScanImport {
+        module_request: record.module_request.to_string(),
+        resolved_id: record.resolved_module.and_then(&module_id_by_idx),
+        kind: record.kind,
+        importer_span: ModuleSourceScanSpan {
+          start: record.importer_span.start,
+          end: record.importer_span.end,
+        },
+      })
+      .collect();
+
+    Some(ModuleSourceScanModule { id, source, module_type, exports_kind, imports })
+  }
+
   fn trace_action_module_graph_ready(scan_stage_output: &NormalizedScanStageOutput) {
     if trace_action_enabled!() {
       let modules = scan_stage_output
@@ -364,6 +516,33 @@ impl<Fs: FileSystem + Clone + 'static> Bundle<Fs> {
             imports: None,
             importers: None,
           },
+        })
+        .collect();
+      trace_action!(action::ModuleGraphReady { action: "ModuleGraphReady", modules });
+    }
+  }
+
+  fn trace_action_module_source_graph_ready(output: &ModuleSourceScanOutput) {
+    if trace_action_enabled!() {
+      let modules = output
+        .modules
+        .iter()
+        .map(|m| action::Module {
+          id: m.id.to_string(),
+          is_external: false,
+          imports: Some(
+            m.imports
+              .iter()
+              .filter_map(|r| {
+                r.resolved_id.as_ref().map(|module_id| action::ModuleImport {
+                  module_id: module_id.to_string(),
+                  kind: r.kind.to_string(),
+                  module_request: r.module_request.clone(),
+                })
+              })
+              .collect(),
+          ),
+          importers: None,
         })
         .collect();
       trace_action!(action::ModuleGraphReady { action: "ModuleGraphReady", modules });
@@ -404,6 +583,19 @@ impl<Fs: FileSystem + Clone + 'static> Bundle<Fs> {
     &self,
     result: BuildResult<BundleOutput>,
   ) -> BuildResult<BundleOutput> {
+    result.map(|mut output| {
+      if let Some(plugins) = self.plugin_driver.get_plugin_timings_info() {
+        output.warnings.push(BuildDiagnostic::plugin_timings(plugins).with_severity_warning());
+      }
+      output
+    })
+  }
+
+  /// Append plugin timings warning to module-source scan result if applicable.
+  fn append_module_source_scan_plugin_timings_warning(
+    &self,
+    result: BuildResult<ModuleSourceScanOutput>,
+  ) -> BuildResult<ModuleSourceScanOutput> {
     result.map(|mut output| {
       if let Some(plugins) = self.plugin_driver.get_plugin_timings_info() {
         output.warnings.push(BuildDiagnostic::plugin_timings(plugins).with_severity_warning());

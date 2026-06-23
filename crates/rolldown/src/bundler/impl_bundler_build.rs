@@ -1,4 +1,4 @@
-use crate::types::bundle_output::BundleOutput;
+use crate::types::{bundle_output::BundleOutput, module_source_scan::ModuleSourceScanOutput};
 use rolldown_common::BundleMode;
 #[cfg(feature = "experimental")]
 use rolldown_common::ScanMode;
@@ -50,6 +50,14 @@ impl Bundler {
     let bundle = self.bundle_factory.create_bundle(BundleMode::FullBuild, None)?;
     bundle.scan().await?;
     Ok(())
+  }
+
+  #[tracing::instrument(target = "devtool", level = "debug", skip_all)]
+  pub async fn scan_module_sources(&mut self) -> BuildResult<ModuleSourceScanOutput> {
+    self.create_error_if_closed()?;
+    self.ensure_last_bundle_closed().await?;
+    let bundle = self.bundle_factory.create_bundle(BundleMode::FullBuild, None)?;
+    bundle.scan_module_sources().await
   }
 
   /// Close the bundler, calling the `closeBundle` plugin hook.

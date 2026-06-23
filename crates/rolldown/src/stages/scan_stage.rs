@@ -161,6 +161,24 @@ impl<Fs: FileSystem + Clone + 'static> ScanStage<Fs> {
     mode: ScanMode<ArcStr>,
     cache: &mut ScanStageCache,
   ) -> BuildResult<ScanStageOutput> {
+    self.scan_with_link_output(mode, cache, true).await
+  }
+
+  #[tracing::instrument(target = "devtool", level = "debug", skip_all)]
+  pub async fn scan_module_sources(
+    &self,
+    mode: ScanMode<ArcStr>,
+    cache: &mut ScanStageCache,
+  ) -> BuildResult<ScanStageOutput> {
+    self.scan_with_link_output(mode, cache, false).await
+  }
+
+  async fn scan_with_link_output(
+    &self,
+    mode: ScanMode<ArcStr>,
+    cache: &mut ScanStageCache,
+    retain_link_output: bool,
+  ) -> BuildResult<ScanStageOutput> {
     let fetch_mode = match mode {
       ScanMode::Full => ScanMode::Full,
       ScanMode::Partial(changed_ids) => {
@@ -176,6 +194,7 @@ impl<Fs: FileSystem + Clone + 'static> ScanStage<Fs> {
       Arc::clone(&self.plugin_driver),
       cache,
       fetch_mode.is_full(),
+      retain_link_output,
       tx_clone,
     )?;
 

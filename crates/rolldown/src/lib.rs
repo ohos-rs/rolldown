@@ -26,7 +26,13 @@ pub use crate::{
   },
   bundler::Bundler,
   bundler_builder::BundlerBuilder,
-  types::{bundle_output::BundleOutput, bundler_config::BundlerConfig},
+  types::{
+    bundle_output::BundleOutput,
+    bundler_config::BundlerConfig,
+    module_source_scan::{
+      ModuleSourceScanImport, ModuleSourceScanModule, ModuleSourceScanOutput, ModuleSourceScanSpan,
+    },
+  },
 };
 
 pub use rolldown_common::bundler_options::*;

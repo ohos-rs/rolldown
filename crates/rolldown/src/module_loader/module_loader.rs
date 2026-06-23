@@ -113,6 +113,7 @@ pub struct ModuleLoader<'a, Fs: FileSystem + Clone + 'static> {
   intermediate_normal_modules: IntermediateNormalModules,
   symbol_ref_db: SymbolRefDb,
   is_full_scan: bool,
+  retain_link_output: bool,
   new_added_modules_from_partial_scan: FxIndexSet<ModuleIdx>,
   cache: &'a mut ScanStageCache,
   pub flat_options: FlatOptions,
@@ -166,6 +167,7 @@ impl<'a, Fs: FileSystem + Clone + 'static> ModuleLoader<'a, Fs> {
     plugin_driver: SharedPluginDriver,
     cache: &'a mut ScanStageCache,
     is_full_scan: bool,
+    retain_link_output: bool,
     magic_string_tx: Option<std::sync::mpsc::Sender<SourceMapGenMsg>>,
   ) -> BuildResult<Self> {
     if is_full_scan {
@@ -206,6 +208,7 @@ impl<'a, Fs: FileSystem + Clone + 'static> ModuleLoader<'a, Fs> {
       cache,
       remaining: 0,
       is_full_scan,
+      retain_link_output,
       shared_context,
       symbol_ref_db,
       intermediate_normal_modules,
@@ -538,8 +541,16 @@ impl<'a, Fs: FileSystem + Clone + 'static> ModuleLoader<'a, Fs> {
           }
 
           module.set_import_records(import_records);
-          *self.intermediate_normal_modules.index_ecma_ast.get_mut(module_idx) = Some(ast);
-          *self.intermediate_normal_modules.stmt_infos.get_mut(module_idx) = Some(stmt_infos);
+          if self.retain_link_output {
+            *self.intermediate_normal_modules.index_ecma_ast.get_mut(module_idx) = Some(ast);
+            *self.intermediate_normal_modules.stmt_infos.get_mut(module_idx) = Some(stmt_infos);
+            self.symbol_ref_db.store_local_db(module_idx, symbols);
+            if preserve_jsx {
+              self.symbol_ref_db.set_has_module_preserve_jsx();
+            }
+          } else {
+            drop((ast, symbols, stmt_infos));
+          }
           *self.intermediate_normal_modules.modules.get_mut(module_idx) = Some(module);
 
           if let Some((imported_exports_per_record, _)) = initialized_barrel_tracking {
@@ -556,10 +567,6 @@ impl<'a, Fs: FileSystem + Clone + 'static> ModuleLoader<'a, Fs> {
             self.process_barrel_import_record(&mut work_queue, &user_defined_entries);
           }
 
-          self.symbol_ref_db.store_local_db(module_idx, symbols);
-          if preserve_jsx {
-            self.symbol_ref_db.set_has_module_preserve_jsx();
-          }
           self.remaining -= 1;
         }
         ModuleLoaderMsg::ExternalModuleDone(task_result) => {
@@ -622,10 +629,13 @@ impl<'a, Fs: FileSystem + Clone + 'static> ModuleLoader<'a, Fs> {
           module.import_records = import_records;
 
           *self.intermediate_normal_modules.modules.get_mut(runtime.id()) = Some(module.into());
-          *self.intermediate_normal_modules.index_ecma_ast.get_mut(runtime.id()) = Some(ast);
-          *self.intermediate_normal_modules.stmt_infos.get_mut(runtime.id()) = Some(stmt_infos);
-
-          self.symbol_ref_db.store_local_db(runtime.id(), local_symbol_ref_db);
+          if self.retain_link_output {
+            *self.intermediate_normal_modules.index_ecma_ast.get_mut(runtime.id()) = Some(ast);
+            *self.intermediate_normal_modules.stmt_infos.get_mut(runtime.id()) = Some(stmt_infos);
+            self.symbol_ref_db.store_local_db(runtime.id(), local_symbol_ref_db);
+          } else {
+            drop((ast, stmt_infos, local_symbol_ref_db));
+          }
           self.remaining -= 1;
 
           errors.extend(runtime.validate_symbols(&rolldown_common::RUNTIME_HELPER_NAMES));
@@ -753,19 +763,38 @@ impl<'a, Fs: FileSystem + Clone + 'static> ModuleLoader<'a, Fs> {
       HybridIndexVec::Map(map)
     };
 
-    // Build the side `stmt_infos` table parallel to `module_table`. Slots that
-    // never received a `Some(stmt_infos)` (external modules, or normal modules
-    // not produced by tasks) get a fresh empty `StmtInfos` placeholder.
-    let stmt_infos_iter = std::mem::take(&mut self.intermediate_normal_modules.stmt_infos)
-      .into_iter_enumerated()
-      .into_iter()
-      .map(|(idx, stmt_infos)| (idx, stmt_infos.unwrap_or_else(StmtInfos::new)));
-    let stmt_infos = if is_dense_index_vec {
-      let vec = stmt_infos_iter.map(|(_, s)| s).collect();
-      HybridIndexVec::IndexVec(IndexVec::from_vec(vec))
+    let (index_ecma_ast, stmt_infos, symbol_ref_db) = if self.retain_link_output {
+      // Build the side `stmt_infos` table parallel to `module_table`. Slots that
+      // never received a `Some(stmt_infos)` (external modules, or normal modules
+      // not produced by tasks) get a fresh empty `StmtInfos` placeholder.
+      let stmt_infos_iter = std::mem::take(&mut self.intermediate_normal_modules.stmt_infos)
+        .into_iter_enumerated()
+        .into_iter()
+        .map(|(idx, stmt_infos)| (idx, stmt_infos.unwrap_or_else(StmtInfos::new)));
+      let stmt_infos = if is_dense_index_vec {
+        let vec = stmt_infos_iter.map(|(_, s)| s).collect();
+        HybridIndexVec::IndexVec(IndexVec::from_vec(vec))
+      } else {
+        let map = stmt_infos_iter.collect::<FxHashMap<_, _>>();
+        HybridIndexVec::Map(map)
+      };
+      (
+        std::mem::take(&mut self.intermediate_normal_modules.index_ecma_ast),
+        stmt_infos,
+        std::mem::take(&mut self.symbol_ref_db),
+      )
+    } else if is_dense_index_vec {
+      (
+        HybridIndexVec::IndexVec(IndexVec::new()),
+        HybridIndexVec::IndexVec(IndexVec::new()),
+        SymbolRefDb::new(),
+      )
     } else {
-      let map = stmt_infos_iter.collect::<FxHashMap<_, _>>();
-      HybridIndexVec::Map(map)
+      (
+        HybridIndexVec::Map(FxHashMap::default()),
+        HybridIndexVec::Map(FxHashMap::default()),
+        SymbolRefDb::new(),
+      )
     };
 
     // Some module was not treated as an entry, but was emitted by `this.emitFile` during
@@ -824,8 +853,8 @@ impl<'a, Fs: FileSystem + Clone + 'static> ModuleLoader<'a, Fs> {
       dynamic_import_exports_usage_map,
       overrode_preserve_entry_signature_map,
       entry_point_to_reference_ids,
-      symbol_ref_db: std::mem::take(&mut self.symbol_ref_db),
-      index_ecma_ast: std::mem::take(&mut self.intermediate_normal_modules.index_ecma_ast),
+      symbol_ref_db,
+      index_ecma_ast,
       stmt_infos,
       new_added_modules_from_partial_scan: std::mem::take(
         &mut self.new_added_modules_from_partial_scan,

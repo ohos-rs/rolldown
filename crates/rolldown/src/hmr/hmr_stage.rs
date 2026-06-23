@@ -260,6 +260,7 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
         Arc::clone(&self.plugin_driver),
         self.cache,
         fetch_mode.is_full(),
+        true,
         None,
       )?;
 
@@ -368,6 +369,7 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
       Arc::clone(&self.plugin_driver),
       self.cache,
       fetch_mode.is_full(),
+      true,
       None,
     )?;
 
@@ -594,6 +596,7 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
         Arc::clone(&self.plugin_driver),
         self.cache,
         fetch_mode.is_full(),
+        true,
         // TODO: support `background sourcemap generation` for hmr
         None,
       )?;

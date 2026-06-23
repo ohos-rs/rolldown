@@ -7,5 +7,6 @@ pub mod bundler_config;
 pub mod generator;
 pub mod linking_metadata;
 pub mod module_factory;
+pub mod module_source_scan;
 pub mod oxc_parse_type;
 pub mod scan_stage_cache;
