@@ -900,12 +900,42 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   }
 
   fn scan_import_decl(&mut self, decl: &ImportDeclaration) {
-    let rec_id = self.add_import_record(
+    self.scan_esm_import(
       decl.source.value.as_str(),
-      ImportKind::Import,
       decl.source.span(),
       decl.span,
-      if decl.source.span().is_empty() {
+      decl.node_id(),
+      decl.with_clause.as_deref(),
+      decl.specifiers.as_ref(),
+    );
+  }
+
+  fn scan_lazy_import_decl(&mut self, decl: &ast::LazyImportDeclaration) {
+    self.scan_esm_import(
+      decl.source.value.as_str(),
+      decl.source.span(),
+      decl.span,
+      decl.node_id(),
+      decl.with_clause.as_deref(),
+      decl.specifiers.as_ref(),
+    );
+  }
+
+  fn scan_esm_import(
+    &mut self,
+    source: &str,
+    source_span: Span,
+    span: Span,
+    node_id: NodeId,
+    with_clause: Option<&ast::WithClause>,
+    specifiers: Option<&oxc::allocator::Vec<ast::ImportDeclarationSpecifier>>,
+  ) {
+    let rec_id = self.add_import_record(
+      source,
+      ImportKind::Import,
+      source_span,
+      span,
+      if source_span.is_empty() {
         ImportRecordMeta::IsUnspannedImport
       } else {
         ImportRecordMeta::empty()
@@ -913,15 +943,15 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
       None,
     );
 
-    if let Some(ref with_clause) = decl.with_clause {
+    if let Some(with_clause) = with_clause {
       self
         .result
         .import_attribute_map
         .insert(rec_id, ImportAttribute::from_with_clause(with_clause));
     }
-    self.result.imports.insert(decl.node_id(), rec_id);
+    self.result.imports.insert(node_id, rec_id);
 
-    let Some(specifiers) = &decl.specifiers else { return };
+    let Some(specifiers) = specifiers else { return };
     specifiers.iter().for_each(|spec| match spec {
       ast::ImportDeclarationSpecifier::ImportSpecifier(spec) => {
         let sym = spec.local.symbol_id();
@@ -943,6 +973,10 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
       ast::ModuleDeclaration::ImportDeclaration(decl) => {
         self.esm_import_keyword.get_or_insert(Span::new(decl.span.start, decl.span.start + 6));
         self.scan_import_decl(decl);
+      }
+      ast::ModuleDeclaration::LazyImportDeclaration(decl) => {
+        self.esm_import_keyword.get_or_insert(Span::new(decl.span.start, decl.span.start + 6));
+        self.scan_lazy_import_decl(decl);
       }
       ast::ModuleDeclaration::ExportAllDeclaration(decl) => {
         self.set_esm_export_keyword(Span::new(decl.span.start, decl.span.start + 6));

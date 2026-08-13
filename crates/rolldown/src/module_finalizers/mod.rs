@@ -2203,6 +2203,9 @@ impl<'me, 'ast> ScopeHoistingFinalizer<'me, 'ast> {
             ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => {
               unreachable!("TypeScript declarations are stripped before the finalizer runs")
             }
+            ast::ExportDefaultDeclarationKind::StructStatement(struct_stmt) => {
+              top_stmt = ast::Statement::from(ast::Declaration::StructStatement(struct_stmt));
+            }
           }
 
           // Transfer span of ExportDefaultDeclaration to FunctionDeclaration to preserve the

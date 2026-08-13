@@ -177,6 +177,12 @@ export interface MangleOptionsKeepNames {
 export declare function minify(filename: string, sourceText: string, options?: MinifyOptions | undefined | null): Promise<MinifyResult>
 
 export interface MinifyOptions {
+  /**
+   * Treat the source text as `js`, `jsx`, `ts`, `tsx`, `dts`, or explicitly
+   * selected static ETS. A `.ets` filename without `ets-static` keeps using
+   * the ArkUI/ArkTS 1.1 grammar.
+   */
+  lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts' | 'ets-static'
   /** Use when minifying an ES module. */
   module?: boolean
   compress?: boolean | CompressOptions
@@ -383,8 +389,12 @@ export type ImportNameKind = /** `import { x } from "mod"` */
 export declare function parse(filename: string, sourceText: string, options?: ParserOptions | undefined | null): Promise<ParseResult>
 
 export interface ParserOptions {
-  /** Treat the source text as `js`, `jsx`, `ts`, `tsx` or `dts`. */
-  lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts'
+  /**
+   * Treat the source text as `js`, `jsx`, `ts`, `tsx`, `dts` or explicitly
+   * selected static ETS. A `.ets` filename without `ets-static` keeps using
+   * the ArkUI/ArkTS 1.1 grammar.
+   */
+  lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts' | 'ets-static'
   /** Treat the source text as `script` or `module` code. */
   sourceType?: 'script' | 'module' | 'commonjs' | 'unambiguous' | undefined
   /**
@@ -989,6 +999,11 @@ export declare function isolatedDeclaration(filename: string, sourceText: string
 
 export interface IsolatedDeclarationsOptions {
   /**
+   * Explicitly parse the input as static ETS. A `.ets` filename without
+   * `ets-static` keeps the existing ArkUI/ArkTS 1.1 behavior.
+   */
+  lang?: 'ets-static'
+  /**
    * Do not emit declarations for code that has an @internal annotation in its JSDoc comment.
    * This is an internal compiler option; use at your own risk, because the compiler does not check that the result is valid.
    *
@@ -1099,6 +1114,11 @@ export interface JsxOptions {
 export declare function moduleRunnerTransform(filename: string, sourceText: string, options?: ModuleRunnerTransformOptions | undefined | null): Promise<ModuleRunnerTransformResult>
 
 export interface ModuleRunnerTransformOptions {
+  /**
+   * Explicitly parse `.ets` input as static ETS. Without this option, `.ets`
+   * continues to use the ArkUI/ArkTS 1.1 grammar.
+   */
+  lang?: 'ets-static'
   /**
    * Enable source map generation.
    *
@@ -1271,8 +1291,12 @@ export declare function transform(filename: string, sourceText: string, options?
  * @see {@link transform}
  */
 export interface TransformOptions {
-  /** Treat the source text as `js`, `jsx`, `ts`, `tsx`, or `dts`. */
-  lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts'
+  /**
+   * Treat the source text as `js`, `jsx`, `ts`, `tsx`, `dts`, or explicitly
+   * selected static ETS. A `.ets` filename without `ets-static` keeps using
+   * the ArkUI/ArkTS 1.1 grammar.
+   */
+  lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts' | 'ets-static'
   /** Treat the source text as `script` or `module` code. */
   sourceType?: 'script' | 'module' | 'commonjs' | 'unambiguous' | undefined
   /**

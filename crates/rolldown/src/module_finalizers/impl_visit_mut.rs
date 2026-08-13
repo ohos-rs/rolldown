@@ -914,6 +914,9 @@ impl<'ast> VisitJsMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
       | ast::Declaration::TSNamespaceDeclaration(_)
       | ast::Declaration::TSImportEqualsDeclaration(_)
       | ast::Declaration::TSGlobalDeclaration(_) => unreachable!(),
+      ast::Declaration::StructStatement(_)
+      | ast::Declaration::AnnotationDeclaration(_)
+      | ast::Declaration::ETSOverloadDeclaration(_) => {}
     }
 
     walk_js_mut::walk_declaration(self, it);

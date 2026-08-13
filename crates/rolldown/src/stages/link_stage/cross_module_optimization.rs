@@ -505,6 +505,9 @@ impl<'a, 'ast: 'a> VisitJs<'ast> for CrossModuleOptimizationRunnerContext<'a, 'a
         cls_decl.id.as_ref().map(BindingIdentifier::symbol_id)
       }
       ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => unreachable!(),
+      ExportDefaultDeclarationKind::StructStatement(struct_stmt) => {
+        Some(struct_stmt.id.symbol_id())
+      }
     };
 
     let symbol_id =

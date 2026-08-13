@@ -590,9 +590,11 @@ impl<'a> StmtEvalAnalyzer<'a> {
       ast::ModuleDeclaration::ExportAllDeclaration(_)
       | ast::ModuleDeclaration::ExportFromDeclaration(_)
       | ast::ModuleDeclaration::ExportNamedDeclaration(_)
-      | ast::ModuleDeclaration::ImportDeclaration(_) => {
+      | ast::ModuleDeclaration::ImportDeclaration(_)
+      | ast::ModuleDeclaration::LazyImportDeclaration(_) => {
         // We consider `import ...` has no side effect. However, `import ...` might be rewritten to other statements by the bundler.
         // In that case, we will mark the statement as having side effect in link stage.
+        // ArkTS `import lazy` is a static import for graph purposes.
         StmtEvalFacts::default()
       }
       ast::ModuleDeclaration::ExportDefaultDeclaration(default_decl) => {
@@ -606,7 +608,8 @@ impl<'a> StmtEvalAnalyzer<'a> {
             // Same definition-time order-sensitivity as a plain class declaration.
             self.analyze_class_definition(class.may_have_side_effects(self), class)
           }
-          ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => {
+          ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(_)
+          | ast::ExportDefaultDeclarationKind::StructStatement(_) => {
             StmtEvalFacts::from_unknown_side_effect()
           }
         }
@@ -863,7 +866,9 @@ impl<'analyzer, 'ctx> EagerEvaluationOrderReasonCollector<'analyzer, 'ctx> {
           }
         }
         // Type-level construct, no runtime evaluation.
-        ast::ClassElement::TSIndexSignature(_) => {}
+        ast::ClassElement::TSIndexSignature(_)
+        | ast::ClassElement::ETSOverloadDeclaration(_)
+        | ast::ClassElement::TSCallSignatureDeclaration(_) => {}
       }
     }
   }
