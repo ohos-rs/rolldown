@@ -163,6 +163,7 @@ impl<Fs: FileSystem + Clone> Drop for ModuleLoader<'_, Fs> {
 }
 
 impl<'a, Fs: FileSystem + Clone + 'static> ModuleLoader<'a, Fs> {
+  #[expect(clippy::too_many_arguments)]
   pub fn new(
     fs: Fs,
     options: SharedOptions,
