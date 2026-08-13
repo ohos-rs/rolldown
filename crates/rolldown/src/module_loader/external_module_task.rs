@@ -67,8 +67,8 @@ impl<Fs: FileSystem> ExternalModuleTask<Fs> {
       }),
     );
 
-    let need_renormalize_render_path = !matches!(resolved_id.external, ResolvedExternal::Absolute)
-      && Path::new(resolved_id.id.as_str()).is_absolute();
+    let need_renormalize_render_path =
+      !matches!(resolved_id.external, ResolvedExternal::Absolute) && resolved_id.id.is_path();
 
     let file_name: ArcStr = if need_renormalize_render_path {
       let entries_common_dir = commondir::common_dir(
@@ -76,17 +76,14 @@ impl<Fs: FileSystem> ExternalModuleTask<Fs> {
       )
       .expect("should have common dir for entries");
       let relative_path = Path::new(resolved_id.id.as_str()).relative(&entries_common_dir);
-      relative_path.to_slash_lossy().into()
+      ArcStr::from(relative_path.to_slash())
     } else {
       resolved_id.id.as_arc_str().clone()
     };
 
     let identifier_name: ArcStr = if need_renormalize_render_path {
-      Path::new(resolved_id.id.as_str())
-        .relative(&self.ctx.options.cwd)
-        .normalize()
-        .to_slash_lossy()
-        .into()
+      let relative_path = Path::new(resolved_id.id.as_str()).relative(&self.ctx.options.cwd);
+      ArcStr::from(relative_path.to_slash())
     } else {
       resolved_id.id.as_arc_str().clone()
     };

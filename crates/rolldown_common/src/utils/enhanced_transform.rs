@@ -283,7 +283,7 @@ pub fn enhanced_transform(
       let found = match result {
         Ok(found) => found,
         Err(err) => {
-          errors.push(BuildDiagnostic::tsconfig_error(filename.to_string(), err));
+          errors.push(BuildDiagnostic::tsconfig_error(err));
           return EnhancedTransformResult::new_for_error(errors, warnings, tsconfig_file_paths);
         }
       };
@@ -324,7 +324,11 @@ pub fn enhanced_transform(
 
   let allocator = Allocator::default();
   let parse_ret = Parser::new(&allocator, &source, source_type)
-    .with_options(ParseOptions { allow_return_outside_function: true, ..Default::default() })
+    .with_options(ParseOptions {
+      allow_return_outside_function: true,
+      preserve_parens: false,
+      ..Default::default()
+    })
     .parse();
   if parse_ret.panicked || !parse_ret.diagnostics.is_empty() {
     append_oxc_diagnostics(parse_ret.diagnostics, &source, filename, &mut warnings, &mut errors);
@@ -420,9 +424,11 @@ pub fn enhanced_transform(
     })
     .build(&program);
 
-  let output_map = match (input_map, codegen_ret.map.map(oxc_sourcemap::SourceMap::into_owned)) {
+  let output_map = match (input_map, codegen_ret.map) {
+    // The collapse only keeps strings from `im`, so the borrowed codegen map can be
+    // used directly — detaching it first would copy the whole source for nothing.
     (Some(im), Some(om)) => Some(collapse_sourcemaps(&[&im, &om])),
-    (None, map) => map,
+    (None, map) => map.map(oxc_sourcemap::SourceMap::into_owned),
     (Some(_), None) => None,
   };
 
