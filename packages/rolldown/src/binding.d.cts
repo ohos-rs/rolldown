@@ -139,6 +139,17 @@ export interface MangleOptions {
    * @default false
    */
   keepNames?: boolean | MangleOptionsKeepNames
+  /**
+   * Names that bindings must not be renamed to, and that bindings already
+   * carrying them keep. Equivalent to terser's `mangle.reserved`.
+   *
+   * Pass `['exports', 'module']` when minifying prebuilt CommonJS / UMD files
+   * that Node consumers `import` directly, so Node's cjs-module-lexer can still
+   * detect the mangled module's named exports.
+   *
+   * @default []
+   */
+  reserved?: Array<string>
   /** Debug mangled names. */
   debug?: boolean
 }
@@ -166,6 +177,12 @@ export interface MangleOptionsKeepNames {
 export declare function minify(filename: string, sourceText: string, options?: MinifyOptions | undefined | null): Promise<MinifyResult>
 
 export interface MinifyOptions {
+  /**
+   * Treat the source text as `js`, `jsx`, `ts`, `tsx`, `dts`, or explicitly
+   * selected static ETS. A `.ets` filename without `ets-static` keeps using
+   * the ArkUI/ArkTS 1.1 grammar.
+   */
+  lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts' | 'ets-static'
   /** Use when minifying an ES module. */
   module?: boolean
   compress?: boolean | CompressOptions
@@ -372,8 +389,12 @@ export type ImportNameKind = /** `import { x } from "mod"` */
 export declare function parse(filename: string, sourceText: string, options?: ParserOptions | undefined | null): Promise<ParseResult>
 
 export interface ParserOptions {
-  /** Treat the source text as `js`, `jsx`, `ts`, `tsx` or `dts`. */
-  lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts'
+  /**
+   * Treat the source text as `js`, `jsx`, `ts`, `tsx`, `dts` or explicitly
+   * selected static ETS. A `.ets` filename without `ets-static` keeps using
+   * the ArkUI/ArkTS 1.1 grammar.
+   */
+  lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts' | 'ets-static'
   /** Treat the source text as `script` or `module` code. */
   sourceType?: 'script' | 'module' | 'commonjs' | 'unambiguous' | undefined
   /**
@@ -978,6 +999,11 @@ export declare function isolatedDeclaration(filename: string, sourceText: string
 
 export interface IsolatedDeclarationsOptions {
   /**
+   * Explicitly parse the input as static ETS. A `.ets` filename without
+   * `ets-static` keeps the existing ArkUI/ArkTS 1.1 behavior.
+   */
+  lang?: 'ets-static'
+  /**
    * Do not emit declarations for code that has an @internal annotation in its JSDoc comment.
    * This is an internal compiler option; use at your own risk, because the compiler does not check that the result is valid.
    *
@@ -1088,6 +1114,11 @@ export interface JsxOptions {
 export declare function moduleRunnerTransform(filename: string, sourceText: string, options?: ModuleRunnerTransformOptions | undefined | null): Promise<ModuleRunnerTransformResult>
 
 export interface ModuleRunnerTransformOptions {
+  /**
+   * Explicitly parse `.ets` input as static ETS. Without this option, `.ets`
+   * continues to use the ArkUI/ArkTS 1.1 grammar.
+   */
+  lang?: 'ets-static'
   /**
    * Enable source map generation.
    *
@@ -1260,8 +1291,12 @@ export declare function transform(filename: string, sourceText: string, options?
  * @see {@link transform}
  */
 export interface TransformOptions {
-  /** Treat the source text as `js`, `jsx`, `ts`, `tsx`, or `dts`. */
-  lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts'
+  /**
+   * Treat the source text as `js`, `jsx`, `ts`, `tsx`, `dts`, or explicitly
+   * selected static ETS. A `.ets` filename without `ets-static` keeps using
+   * the ArkUI/ArkTS 1.1 grammar.
+   */
+  lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts' | 'ets-static'
   /** Treat the source text as `script` or `module` code. */
   sourceType?: 'script' | 'module' | 'commonjs' | 'unambiguous' | undefined
   /**
@@ -1553,8 +1588,16 @@ export declare class BindingDevEngine {
   getBundleState(): Promise<BindingBundleState>
   ensureLatestBuildOutput(): Promise<BindingResult<undefined>>
   triggerFullBuild(): void
-  invalidate(caller: string, firstInvalidatedBy?: string | undefined | null): Promise<BindingResult<Array<BindingClientHmrUpdate>>>
-  registerModules(clientId: string, modules: Array<string>): Promise<void>
+  /**
+   * Client-connect signal (the clientId hello): creates the per-client session
+   * with an empty ship map. Reconnects arrive as fresh clientIds.
+   */
+  registerClient(clientId: string): Promise<void>
+  /**
+   * Delivery notification from the serving middleware: the response for
+   * `filename` completed, so record its modules as shipped to that client.
+   */
+  notifyPayloadDelivered(filename: string): Promise<void>
   removeClient(clientId: string): Promise<void>
   close(): Promise<void>
   /**
@@ -1564,7 +1607,7 @@ export declare class BindingDevEngine {
    * The module was previously stubbed with a proxy, and now we need to compile the
    * actual module and its dependencies.
    */
-  compileEntry(moduleId: string, clientId: string): Promise<string>
+  compileEntry(moduleId: string, clientId: string): Promise<BindingLazyChunkOutput>
 }
 
 export declare class BindingLoadPluginContext {
@@ -1679,6 +1722,7 @@ export declare class BindingNormalizedOptions {
   get name(): string | null
   get entryFilenames(): string | undefined
   get chunkFilenames(): string | undefined
+  get sourcemapFilenames(): string | undefined
   get assetFilenames(): string | undefined
   get dir(): string | null
   get file(): string | null
@@ -1840,11 +1884,6 @@ export declare class ParallelJsPluginRegistry {
   id: number
   workerCount: number
   constructor(workerCount: number)
-}
-
-export declare class ScheduledBuild {
-  wait(): Promise<void>
-  alreadyScheduled(): boolean
 }
 
 export declare class TraceSubscriberGuard {
@@ -2026,6 +2065,7 @@ export interface BindingDevtoolsOptions {
 }
 
 export interface BindingDevWatchOptions {
+  enabled?: boolean
   skipWrite?: boolean
   usePolling?: boolean
   pollInterval?: number
@@ -2219,7 +2259,9 @@ export interface BindingEsmExternalRequirePluginConfig {
 export interface BindingExperimentalDevModeOptions {
   host?: string
   port?: number
-  implement?: string
+  implement: string
+  /** @deprecated Common runtime injection will be disabled by default in the future. */
+  skipCommonRuntimeInjection?: boolean
   lazy?: boolean
 }
 
@@ -2247,19 +2289,15 @@ export interface BindingGeneratedCodeOptions {
   preset?: string
 }
 
-export type BindingGenerateHmrPatchReturn =
-  | { type: 'Ok', field0: Array<BindingHmrUpdate> }
-  | { type: 'Error', field0: Array<BindingError> }
-
-export interface BindingHmrBoundaryOutput {
-  boundary: string
-  acceptedVia: string
-}
-
 export type BindingHmrUpdate =
-  | { type: 'Patch', code: string, filename: string, sourcemap?: string, sourcemapFilename?: string, hmrBoundaries: Array<BindingHmrBoundaryOutput> }
-  | { type: 'FullReload', reason?: string }
-  | { type: 'Noop' }
+  | { type: 'Patch', code: string, filename: string, sourcemap?: string, sourcemapFilename?: string, /**
+   * Stable ids of the changed modules — the `changedIds` of the push envelope.
+   * The client walks from these on its own graph.
+   */
+  changedIds: Array<string>, /** Per-client envelope sequence number. */
+seq: number }
+| { type: 'FullReload', reason?: string }
+| { type: 'Noop' }
 
 export interface BindingHookFilter {
   value?: Array<Array<BindingFilterToken>>
@@ -2273,6 +2311,16 @@ export interface BindingHookJsLoadOutput {
 
 export interface BindingHookJsResolveIdOptions {
   isEntry?: boolean
+  /**
+   * - `import-statement`: `import { foo } from './lib.js';`
+   * - `dynamic-import`: `import('./lib.js')`
+   * - `require-call`: `require('./lib.js')`
+   * - `import-rule`: `@import 'bg-color.css'`
+   * - `url-token`: `url('./icon.png')`
+   * - `new-url`: `new URL('./worker.js', import.meta.url)`
+   * - `hot-accept`: `import.meta.hot.accept('./lib.js', () => {})`
+   */
+  kind?: 'import-statement' | 'dynamic-import' | 'require-call' | 'import-rule' | 'url-token' | 'new-url' | 'hot-accept'
   scan?: boolean
   custom?: BindingVitePluginCustom
 }
@@ -2297,6 +2345,24 @@ export interface BindingHookRenderChunkOutput {
    * omitting the field, which mirrors Rollup's "possibly broken" semantics).
    */
   map?: BindingSourcemap | null
+}
+
+export interface BindingHookResolveFileUrlArgs {
+  /** Preliminary filename of the chunk containing the reference. */
+  chunkId: string
+  /** Filename of the emitted file, relative to the output directory. */
+  fileName: string
+  format: 'es' | 'cjs' | 'iife' | 'umd'
+  /** Id of the module containing the `import.meta.ROLLDOWN_FILE_URL_*` reference. */
+  moduleId: string
+  referenceId: string
+  /** Path from the chunk to the emitted file. */
+  relativePath: string
+  /**
+   * The `<urlId>` of `import.meta.ROLLDOWN_FILE_URL_<referenceId>_<urlId>`, if present.
+   * Only the rolldown-specific form carries it; the `ROLLUP_FILE_URL_` alias never does.
+   */
+  urlId?: string
 }
 
 export interface BindingHookResolveIdExtraArgs {
@@ -2338,6 +2404,14 @@ export interface BindingHookTransformOutput {
    */
   map?: BindingSourcemap | null
   moduleType?: string
+}
+
+export interface BindingHotUpdateArgs {
+  kind: 'create' | 'update' | 'delete'
+  /** Normalized absolute path of the changed file. */
+  file: string
+  /** The affected module ids as currently computed (raw module ids). */
+  modules: Array<string>
 }
 
 export interface BindingIndentOptions {
@@ -2392,6 +2466,8 @@ export interface BindingInputOptions {
   keepNames?: boolean
   checks?: BindingChecksOptions
   deferSyncScanData?: undefined | (() => BindingDeferSyncScanData[])
+  /** Asked for while the build is closing, so what it returns includes `closeBundle`. */
+  pluginTimings?: undefined | (() => BindingPluginTimingsMeasurement)
   makeAbsoluteExternalsRelative?: BindingMakeAbsoluteExternalsRelative
   devtools?: BindingDevtoolsOptions
   invalidateJsSideCache?: () => void
@@ -2418,6 +2494,22 @@ export interface BindingJsonSourcemap {
 
 export interface BindingJsWatchChangeEvent {
   event: string
+}
+
+/**
+ * The client-facing slice of a lazy-compile result. The carried modules and
+ * stamps stay server-side as the engine's pending-payload entry.
+ */
+export interface BindingLazyChunkOutput {
+  code: string
+  filename: string
+  /**
+   * The chunk's sourcemap, when `sourcemap` is `File` or `Hidden`. Serve it
+   * under `sourcemapFilename`, which is what the chunk's `sourceMappingURL`
+   * refers to.
+   */
+  sourcemap?: string
+  sourcemapFilename?: string
 }
 
 export interface BindingLog {
@@ -2485,11 +2577,6 @@ export interface BindingMatchGroup {
   includeDependenciesRecursively?: boolean
 }
 
-export interface BindingModulePreloadOptions {
-  polyfill: boolean
-  resolveDependencies?: (filename: string, deps: string[], context: { hostId: string, hostType: 'html' | 'js' }) => string[]
-}
-
 export interface BindingModules {
   values: Array<BindingRenderedModule>
   keys: Array<string>
@@ -2533,6 +2620,7 @@ export interface BindingOutputOptions {
   paths?: Record<string, string> | ((id: string) => string)
   plugins: (BindingBuiltinPlugin | BindingPluginOptions | undefined)[]
   sourcemap?: 'file' | 'inline' | 'hidden'
+  sourcemapFileNames?: string | ((chunk: PreRenderedChunk) => string)
   sourcemapBaseUrl?: string
   sourcemapIgnoreList?: boolean | string | RegExp | ((source: string, sourcemapPath: string) => boolean)
   sourcemapDebugIds?: boolean
@@ -2560,6 +2648,8 @@ export interface BindingOutputs {
 
 export interface BindingOverwriteOptions {
   contentOnly?: boolean
+  /** Stores the replaced content in the generated sourcemap's `names` field. */
+  storeName?: boolean
 }
 
 export interface BindingPluginContextResolvedId {
@@ -2615,6 +2705,8 @@ export interface BindingPluginOptions {
   renderChunkFilter?: BindingHookFilter
   augmentChunkHash?: (ctx: BindingPluginContext, chunk: BindingRenderedChunk) => MaybePromise<void | string>
   augmentChunkHashMeta?: BindingPluginHookMeta
+  resolveFileUrl?: (ctx: BindingPluginContext, args: BindingHookResolveFileUrlArgs) => MaybePromise<void | string | null>
+  resolveFileUrlMeta?: BindingPluginHookMeta
   renderStart?: (ctx: BindingPluginContext, opts: BindingNormalizedOptions) => void
   renderStartMeta?: BindingPluginHookMeta
   renderError?: (ctx: BindingPluginContext, error: BindingError[]) => void
@@ -2627,6 +2719,8 @@ export interface BindingPluginOptions {
   closeBundleMeta?: BindingPluginHookMeta
   watchChange?: (ctx: BindingPluginContext, path: string, event: string) => MaybePromise<VoidNullable>
   watchChangeMeta?: BindingPluginHookMeta
+  hotUpdate?: (ctx: BindingPluginContext, args: BindingHotUpdateArgs) => MaybePromise<VoidNullable<Array<string>>>
+  hotUpdateMeta?: BindingPluginHookMeta
   closeWatcher?: (ctx: BindingPluginContext) => MaybePromise<VoidNullable>
   closeWatcherMeta?: BindingPluginHookMeta
   banner?: (ctx: BindingPluginContext, chunk: BindingRenderedChunk) => void
@@ -2642,6 +2736,33 @@ export interface BindingPluginOptions {
 export declare enum BindingPluginOrder {
   Pre = 0,
   Post = 1
+}
+
+/**
+ * What one callback cost, measured inside it on the JavaScript side — the one place the
+ * measurement exists, since this side can only bracket dispatch and completion.
+ */
+export interface BindingPluginTiming {
+  /** The plugin the callback belongs to, or the options it was configured on. */
+  owner: string
+  kind: 'plugin' | 'outputOption' | 'inputOption'
+  hook: string
+  calls: number
+  ms: number
+  maxInFlight: number
+  /** How much of `ms` is double counted because calls overlapped. */
+  overlapMs: number
+  /**
+   * Whether `ms` may be compared against another row's — false once two calls of this hook
+   * overlapped, because then their spans cover work each other was doing.
+   */
+  rankable: boolean
+}
+
+export interface BindingPluginTimingsMeasurement {
+  /** Wall time in which any measured callback was running, counting overlap once. */
+  busyMs: number
+  rows: Array<BindingPluginTiming>
 }
 
 export interface BindingPluginWithIndex {
@@ -2673,20 +2794,7 @@ export declare enum BindingPropertyWriteSideEffects {
 
 export declare enum BindingRebuildStrategy {
   Always = 0,
-  Auto = 1,
-  Never = 2
-}
-
-export interface BindingRenderBuiltUrlConfig {
-  ssr: boolean
-  type: 'asset' | 'public'
-  hostId: string
-  hostType: 'js' | 'css' | 'html'
-}
-
-export interface BindingRenderBuiltUrlRet {
-  relative?: boolean
-  runtime?: string
+  Never = 1
 }
 
 export interface BindingReplacePluginConfig {
@@ -2695,11 +2803,6 @@ export interface BindingReplacePluginConfig {
   preventAssignment?: boolean
   objectGuards?: boolean
   sourcemap?: boolean
-}
-
-export interface BindingResolveDependenciesContext {
-  hostId: string
-  hostType: string
 }
 
 export type BindingResolvedExternal =
@@ -2814,6 +2917,8 @@ export interface BindingTsconfigResult {
 
 export interface BindingUpdateOptions {
   overwrite?: boolean
+  /** Stores the replaced content in the generated sourcemap's `names` field. */
+  storeName?: boolean
 }
 
 export interface BindingViteAliasPluginAlias {
@@ -3045,19 +3150,14 @@ export declare function registerPlugins(id: number, plugins: Array<BindingPlugin
 export declare function resolveTsconfig(filename: string, cache: TsconfigCache | undefined | null, yarnPnp: boolean): BindingTsconfigResult | null
 
 /**
- * Shutdown the tokio runtime manually.
+ * Release one holder of the tokio runtime, shutting it down once none are left.
  *
  * This is required for the wasm target with `tokio_unstable` cfg.
  * In the wasm runtime, the `park` threads will hang there until the tokio::Runtime is shutdown.
  */
 export declare function shutdownAsyncRuntime(): void
 
-/**
- * Start the async runtime manually.
- *
- * This is required when the async runtime is shutdown manually.
- * Usually it's used in test.
- */
+/** Acquire one holder of the tokio runtime, starting it if it is not running. */
 export declare function startAsyncRuntime(): void
 
 export interface ViteImportGlobMeta {

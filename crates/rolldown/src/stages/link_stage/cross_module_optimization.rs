@@ -1,18 +1,19 @@
 use oxc::{
   ast::{
-    AstBuilder, AstKind,
+    AstKind,
     ast::{
-      BindingIdentifier, BindingPattern, Declaration, ExportDefaultDeclaration,
-      ExportDefaultDeclarationKind, ExportNamedDeclaration,
+      BindingIdentifier, BindingPattern, Declaration, ExportDeclaration, ExportDefaultDeclaration,
+      ExportDefaultDeclarationKind, Expression,
     },
+    builder::AstBuilder,
   },
-  ast_visit::{Visit, walk},
-  semantic::NodeId,
+  ast_visit::{VisitJs, walk_js},
+  semantic::{NodeId, SymbolId},
 };
 use rolldown_common::{
-  AstScopes, ConstExportMeta, EcmaViewMeta, FlatOptions, GetLocalDb, IndexModules, ModuleIdx,
-  SharedNormalizedBundlerOptions, SideEffectDetail, StmtInfoIdx, SymbolRef, SymbolRefDb,
-  SymbolRefFlags,
+  AstScopes, ConstExportMeta, EcmaViewMeta, FlatOptions, GetLocalDb, IndexModules,
+  MemberExprRefResolutionMap, ModuleIdx, SharedNormalizedBundlerOptions, Specifier, StmtEvalFlags,
+  StmtInfoIdx, SymbolRef, SymbolRefDb, SymbolRefFlags,
 };
 use rolldown_ecmascript_utils::ExpressionExt;
 use rolldown_utils::rayon::{IntoParallelRefIterator, ParallelIterator};
@@ -20,13 +21,13 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ast_scanner::{
   const_eval::{ConstEvalCtx, try_extract_const_literal},
-  side_effect_detector::SideEffectDetector,
+  stmt_eval_analyzer::StmtEvalAnalyzer,
 };
 
 use super::LinkStage;
 
 type MutationResult = (
-  Option<(ModuleIdx, FxHashMap<StmtInfoIdx, SideEffectDetail>)>,
+  Option<(ModuleIdx, FxHashMap<StmtInfoIdx, StmtEvalFlags>)>,
   FxHashMap<SymbolRef, ConstExportMeta>,
   FxHashSet<(ModuleIdx, NodeId)>,
 );
@@ -193,9 +194,21 @@ impl LinkStage<'_> {
             module_idx_and_stmt_idx_to_dynamic_import_expr_node_id_map
               .get(&module_idx)
               .unwrap_or(&default_stmt_idx_to_dynamic_import_expr_node_ids);
+          // Local symbols of `import * as ns` bindings. Property reads on ES module namespace
+          // objects are side-effect-free, so the `StmtEvalAnalyzer` re-run below must know
+          // about them to drop `ns.fn()` calls to `@__NO_SIDE_EFFECTS__` functions. The scanner
+          // builds the same set (see `add_star_import`), but it isn't persisted, so reconstruct
+          // it here from the persisted named imports.
+          let namespace_object_symbol_ids: FxHashSet<SymbolId> = module
+            .named_imports
+            .iter()
+            .filter_map(|(local_ref, named_import)| {
+              matches!(named_import.imported, Specifier::Star).then_some(local_ref.symbol)
+            })
+            .collect();
           let mut ctx = CrossModuleOptimizationRunnerContext {
             local_constant_symbol_map: FxHashMap::default(),
-            side_effect_detail_mutations: FxHashMap::default(),
+            tree_shaking_flags_mutations: FxHashMap::default(),
             side_effect_free_call_expr_node_ids: FxHashSet::default(),
             immutable_ctx: CrossModuleOptimizationImmutableCtx {
               eval_ctx: &eval_ctx,
@@ -208,6 +221,8 @@ impl LinkStage<'_> {
               options: self.options,
               ast_scope: &self.symbols.local_db(module_idx).ast_scopes,
               stmt_idx_to_dynamic_import_expr_node_ids,
+              resolved_member_expr_refs: &self.metas[module_idx].resolved_member_expr_refs,
+              namespace_object_symbol_ids: &namespace_object_symbol_ids,
             },
             // `0` is preserved for namespace stmt
             toplevel_stmt_idx: StmtInfoIdx::from_raw_unchecked(1),
@@ -217,19 +232,19 @@ impl LinkStage<'_> {
           };
           ctx.visit_program(&dep.program);
 
-          let side_effect_mutations = if ctx.side_effect_detail_mutations.is_empty() {
+          let tree_shaking_flags_mutations = if ctx.tree_shaking_flags_mutations.is_empty() {
             None
           } else {
-            Some((module_idx, ctx.side_effect_detail_mutations))
+            Some((module_idx, ctx.tree_shaking_flags_mutations))
           };
-          if side_effect_mutations.is_none()
+          if tree_shaking_flags_mutations.is_none()
             && ctx.local_constant_symbol_map.is_empty()
             && ctx.unreachable_import_expression_node_ids.is_empty()
           {
             return None;
           }
           Some((
-            side_effect_mutations,
+            tree_shaking_flags_mutations,
             ctx.local_constant_symbol_map,
             ctx
               .unreachable_import_expression_node_ids
@@ -242,12 +257,12 @@ impl LinkStage<'_> {
       .collect();
 
     let mut new_constant_refs = FxHashSet::default();
-    for (side_effect_mutations, local_constants, unreachable_node_ids) in mutation_result {
-      if let Some((module_idx, mutations)) = side_effect_mutations
+    for (tree_shaking_flags_mutations, local_constants, unreachable_node_ids) in mutation_result {
+      if let Some((module_idx, mutations)) = tree_shaking_flags_mutations
         && self.module_table[module_idx].as_normal().is_some()
       {
-        for (stmt_info_idx, side_effect_detail) in mutations {
-          self.stmt_infos[module_idx][stmt_info_idx].side_effect = side_effect_detail;
+        for (stmt_info_idx, tree_shaking_flags) in mutations {
+          self.stmt_infos[module_idx][stmt_info_idx].eval_flags = tree_shaking_flags;
         }
       }
 
@@ -275,11 +290,17 @@ struct CrossModuleOptimizationImmutableCtx<'a, 'ast: 'a> {
   options: &'a SharedNormalizedBundlerOptions,
   ast_scope: &'a AstScopes,
   stmt_idx_to_dynamic_import_expr_node_ids: &'a FxHashMap<StmtInfoIdx, FxHashSet<NodeId>>,
+  /// Resolution of namespace/named member expressions (`ns.fn`) to their target symbol,
+  /// used to recognize `ns.fn()` calls to `@__NO_SIDE_EFFECTS__` functions.
+  resolved_member_expr_refs: &'a MemberExprRefResolutionMap,
+  /// Local symbols of `import * as ns` bindings, so property reads on them are treated as
+  /// side-effect-free when re-detecting side effects of statements.
+  namespace_object_symbol_ids: &'a FxHashSet<SymbolId>,
 }
 
 struct CrossModuleOptimizationRunnerContext<'a, 'ast: 'a> {
   local_constant_symbol_map: FxHashMap<SymbolRef, ConstExportMeta>,
-  side_effect_detail_mutations: FxHashMap<StmtInfoIdx, SideEffectDetail>,
+  tree_shaking_flags_mutations: FxHashMap<StmtInfoIdx, StmtEvalFlags>,
   side_effect_free_call_expr_node_ids: FxHashSet<NodeId>,
   immutable_ctx: CrossModuleOptimizationImmutableCtx<'a, 'ast>,
   toplevel_stmt_idx: StmtInfoIdx,
@@ -298,7 +319,41 @@ impl<'a, 'ast: 'a> std::ops::Deref for CrossModuleOptimizationRunnerContext<'a, 
   }
 }
 
-impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast> {
+impl<'ast> CrossModuleOptimizationRunnerContext<'_, 'ast> {
+  /// Resolve a call expression's callee to the canonical declaration symbol it targets, if it is
+  /// a reference we can statically reason about:
+  /// - a bare identifier callee (`fn()`), or
+  /// - a namespace/named member-access callee that fully resolves to an exported binding
+  ///   (`ns.fn()`).
+  ///
+  /// Handling the member-access form is what makes `@__NO_SIDE_EFFECTS__` apply to namespace
+  /// imports across chunk boundaries (the call stays as `ns.fn()` until finalization, long after
+  /// side-effect detection has run).
+  fn resolve_callee_canonical_symbol(&self, callee: &Expression<'ast>) -> Option<SymbolRef> {
+    if let Some(ident) = callee.as_identifier() {
+      let ref_id = ident.reference_id.get()?;
+      let symbol_id = self.immutable_ctx.eval_ctx.scope.get_reference(ref_id).symbol_id()?;
+      return Some(
+        self
+          .immutable_ctx
+          .symbols
+          .canonical_ref_for((self.immutable_ctx.module_idx, symbol_id).into()),
+      );
+    }
+
+    let member_expr = callee.as_member_expression()?;
+    let resolution = self.immutable_ctx.resolved_member_expr_refs.get(&member_expr.node_id())?;
+    // Only treat it as a direct call to the resolved binding when the whole member expression
+    // resolves to it (e.g. `ns.fn`). If trailing properties remain (e.g. `ns.fn.bar`), the call
+    // targets something else.
+    if !resolution.prop_and_related_span_list.is_empty() {
+      return None;
+    }
+    Some(self.immutable_ctx.symbols.canonical_ref_for(resolution.resolved?))
+  }
+}
+
+impl<'a, 'ast: 'a> VisitJs<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast> {
   fn enter_node(&mut self, kind: AstKind<'ast>) {
     self.visit_path.push(kind);
   }
@@ -314,15 +369,19 @@ impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast
       self.visit_statement(stmt);
       if pre_node_id_len != self.side_effect_free_call_expr_node_ids.len() {
         let stmt_info_idx = StmtInfoIdx::new(idx + 1);
-        let side_effect_detail = SideEffectDetector::new(
+        let stmt_eval_facts = StmtEvalAnalyzer::new(
           self.immutable_ctx.ast_scope,
           self.immutable_ctx.flat_options,
           self.immutable_ctx.options,
           Some(&self.side_effect_free_call_expr_node_ids),
-          None,
+          Some(self.immutable_ctx.namespace_object_symbol_ids),
         )
-        .detect_side_effect_of_stmt(stmt);
-        self.side_effect_detail_mutations.insert(stmt_info_idx, side_effect_detail);
+        .analyze_stmt(stmt);
+        // Cross-module optimization only refreshes tree-shaking flags. Module-level
+        // execution-order sensitivity is recorded during AST scanning.
+        self
+          .tree_shaking_flags_mutations
+          .insert(stmt_info_idx, stmt_eval_facts.tree_shaking_flags());
       }
       self.toplevel_stmt_idx += 1;
     }
@@ -348,24 +407,21 @@ impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast
         }
       }
     }
-    walk::walk_import_expression(self, it);
+    walk_js::walk_import_expression(self, it);
   }
 
   fn visit_call_expression(&mut self, it: &oxc::ast::ast::CallExpression<'ast>) {
     let mut pre_node_id = None;
-    let (is_side_effects_free_function, is_pure_annotation_only) = it
-      .callee
-      .as_identifier()
-      .and_then(|item| {
-        let ref_id = item.reference_id.get()?;
-        let symbol_id = self.immutable_ctx.eval_ctx.scope.get_reference(ref_id).symbol_id()?;
-
-        let symbol_ref = self
-          .immutable_ctx
-          .symbols
-          .canonical_ref_for((self.immutable_ctx.module_idx, symbol_id).into());
+    let (is_side_effects_free_function, is_pure_annotation_only) = self
+      .resolve_callee_canonical_symbol(&it.callee)
+      .map(|symbol_ref| {
+        // The binding must also be guaranteed unassigned: a `@__NO_SIDE_EFFECTS__` function
+        // whose export binding is later reassigned would, at the call site, invoke the
+        // replacement (which may have side effects), so the call must not be dropped. This
+        // mirrors what finalization checks for identifier callees.
         let is_free = symbol_ref
-          .is_side_effect_free_function(self.immutable_ctx.symbols, self.immutable_ctx.modules);
+          .is_side_effect_free_function(self.immutable_ctx.symbols, self.immutable_ctx.modules)
+          && symbol_ref.is_not_reassigned(self.immutable_ctx.symbols);
         let is_annotation_only = is_free
           && self
             .immutable_ctx
@@ -374,7 +430,7 @@ impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast
             .flags
             .get(&symbol_ref.symbol)
             .is_some_and(|f| f.contains(SymbolRefFlags::PureAnnotationOnly));
-        Some((is_free, is_annotation_only))
+        (is_free, is_annotation_only)
       })
       .unwrap_or((false, false));
 
@@ -388,17 +444,15 @@ impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast
         pre_node_id = self.latest_side_effect_free_call_expr_node_id.replace(it.node_id());
       }
     }
-    walk::walk_call_expression(self, it);
+    walk_js::walk_call_expression(self, it);
     if let Some(node_id) = pre_node_id {
       self.latest_side_effect_free_call_expr_node_id = Some(node_id);
     }
   }
 
-  fn visit_export_named_declaration(&mut self, it: &ExportNamedDeclaration<'ast>) {
-    if it.source.is_none()
-      && self.immutable_ctx.config.inline_const_optimization
-      && let Some(ref decl) = it.declaration
-      && let Declaration::VariableDeclaration(var_decl) = decl
+  fn visit_export_declaration(&mut self, it: &ExportDeclaration<'ast>) {
+    if self.immutable_ctx.config.inline_const_optimization
+      && let Declaration::VariableDeclaration(var_decl) = &it.declaration
     {
       var_decl.declarations.iter().for_each(|declarator| {
         if let BindingPattern::BindingIdentifier(ref binding) = declarator.id {
@@ -426,7 +480,7 @@ impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast
         }
       });
     }
-    walk::walk_export_named_declaration(self, it);
+    walk_js::walk_export_declaration(self, it);
   }
 
   fn visit_export_default_declaration(&mut self, it: &ExportDefaultDeclaration<'ast>) {
@@ -438,7 +492,7 @@ impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast
     {
       return;
     }
-    walk::walk_export_default_declaration(self, it);
+    walk_js::walk_export_default_declaration(self, it);
     let Some(expr) = it.declaration.as_expression() else {
       return;
     };
@@ -451,6 +505,9 @@ impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast
         cls_decl.id.as_ref().map(BindingIdentifier::symbol_id)
       }
       ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => unreachable!(),
+      ExportDefaultDeclarationKind::StructStatement(struct_stmt) => {
+        Some(struct_stmt.id.symbol_id())
+      }
     };
 
     let symbol_id =

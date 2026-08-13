@@ -37,7 +37,7 @@ pub struct Resolver<Fs: FileSystem = OsFileSystem> {
   package_json_cache: FxDashMap<PathBuf, Arc<PackageJson>>,
 }
 
-impl<Fs: FileSystem + Clone> Resolver<Fs> {
+impl<Fs: FileSystem + Clone + 'static> Resolver<Fs> {
   /// Creates a new resolver with the specified options.
   pub fn new(
     fs: Fs,
@@ -65,6 +65,12 @@ impl<Fs: FileSystem + Clone> Resolver<Fs> {
       new_url_resolver,
       package_json_cache: DashMap::default(),
     }
+  }
+
+  /// The clone shares this resolver's cache, so tsconfig lookups and cache
+  /// clearing stay consistent with module resolution.
+  pub fn clone_default_resolver(&self) -> ResolverGeneric<Fs> {
+    self.default_resolver.clone_with_options(self.default_resolver.options().clone())
   }
 }
 

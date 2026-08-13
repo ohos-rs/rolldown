@@ -28,6 +28,7 @@
     "tmp/**",
     "rollup/**",
     "test262/**",
+    "vite/**",
     "target/**",
     "packages/rollup-tests/test/**",
     "packages/rolldown/npm/**",
