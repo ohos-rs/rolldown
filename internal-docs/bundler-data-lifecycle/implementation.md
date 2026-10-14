@@ -89,6 +89,17 @@ Bundler.cache (ScanStageCache) ──(move)──> Bundle.cache (temporary holde
 | `module_idx_by_abs_path`         | Path-based lookup for watcher                                                                 |
 | `module_idx_by_stable_id`        | Stable ID lookup for HMR                                                                      |
 
+### Transform sourcemap lifetime
+
+`ModuleTask::run_inner` keeps load/transform maps through all transform hooks,
+including `get_combined_sourcemap()`. After `load_source` returns, it releases
+the chain before constructing `EcmaView` when both sourcemap output and dev mode
+are disabled. The module table and incremental snapshot then retain no unused
+transform maps. Sourcemap rendering and dev/HMR keep their existing chains.
+The native magic-string channel is created only with sourcemap output enabled,
+so its scan-stage handler cannot repopulate a released chain. The separate
+virtual runtime module task is unchanged.
+
 ### Cache integrity on a failed build
 
 `ScanStageCache` must survive a _failed_ build whole, not just a successful one

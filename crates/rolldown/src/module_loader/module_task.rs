@@ -112,6 +112,13 @@ impl<Fs: FileSystem + Clone + 'static> ModuleTask<Fs> {
       .load_source(&mut sourcemap_chain, &mut hook_side_effects, self.magic_string_tx.clone())
       .await?;
 
+    // Transform hooks have consumed combined maps; only sourcemap rendering and dev/HMR
+    // need the chain afterward. Avoid retaining it in the module table (including caches).
+    // See internal-docs/bundler-data-lifecycle/implementation.md.
+    if !self.ctx.options.is_sourcemap_enabled() && !self.ctx.options.is_dev_mode_enabled() {
+      sourcemap_chain = Vec::new();
+    }
+
     let stable_id = id.stabilize(&self.ctx.options.cwd);
 
     if matches!(module_type, ModuleType::Css) {
