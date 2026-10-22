@@ -4,12 +4,13 @@ pub mod dynamic_import;
 mod hmr;
 pub mod impl_visit;
 mod import_analyzer;
+mod independent_init;
 mod new_url;
 pub mod stmt_eval_analyzer;
 mod top_level_import_read;
 
 use arcstr::ArcStr;
-use const_eval::{ConstEvalCtx, try_extract_const_literal};
+use const_eval::{ConstEvalCtx, eval_can_assign, try_extract_const_literal};
 use oxc::ast::ast::{BindingPattern, Expression, ImportExpression};
 use oxc::ast::{AstKind, ast};
 use oxc::semantic::{NodeId, Reference, ScopeFlags, Scoping};
@@ -27,7 +28,7 @@ use oxc::{
   span::{GetSpan, Span},
 };
 use oxc_index::IndexVec;
-use oxc_str::CompactStr;
+use oxc_str::{CompactStr, JSStr};
 use rolldown_common::dynamic_import_usage::{DynamicImportExportsUsage, DynamicImportUsageInfo};
 use rolldown_common::{
   ConstExportMeta, ConstantValue, DynamicImportExprInfo, EcmaModuleAstUsage, EcmaViewMeta,
@@ -41,7 +42,7 @@ use rolldown_ecmascript_utils::FunctionExt;
 use rolldown_error::{BuildDiagnostic, BuildResult, CjsExportSpan};
 use rolldown_std_utils::PathExt;
 use rolldown_utils::concat_string;
-use rolldown_utils::ecmascript::legitimize_identifier_name;
+use rolldown_utils::ecmascript::{legitimize_identifier_name, to_usv_str};
 use rolldown_utils::indexmap::FxIndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
@@ -116,6 +117,8 @@ pub struct ScanResult {
   /// `import.meta.ROLLDOWN_FILE_URL_<referenceId>[_<urlId>]`, one entry per occurrence.
   pub rolldown_file_url_references: Vec<RolldownFileUrlReference>,
   pub this_expr_replace_map: FxHashMap<NodeId, ThisExprReplaceKind>,
+  /// See `EcmaView::cjs_this_ref`.
+  pub cjs_this_ref: Option<SymbolRef>,
   pub hmr_info: HmrInfo,
   pub hmr_hot_ref: Option<SymbolRef>,
   pub directive_range: Vec<Span>,
@@ -224,6 +227,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
       new_url_references: FxHashMap::default(),
       rolldown_file_url_references: Vec::new(),
       this_expr_replace_map: FxHashMap::default(),
+      cjs_this_ref: None,
       hmr_info: HmrInfo::default(),
       hmr_hot_ref,
       directive_range: vec![],
@@ -355,6 +359,11 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
       self.result.this_expr_replace_map = generate_replace_this_expr_map(
         &self.top_level_this_expr_set,
         if exports_kind.is_commonjs() {
+          // Top-level `this` is the module's exports object, an implicit `exports` reference.
+          // See internal-docs/linking/determine-module-exports-kind/implementation.md.
+          self.result.ast_usage.insert(EcmaModuleAstUsage::ExportsRef);
+          self.result.cjs_this_ref =
+            Some(self.result.symbol_ref_db.create_facade_root_symbol_ref("this"));
           ThisExprReplaceKind::Exports
         } else {
           ThisExprReplaceKind::Context
@@ -683,7 +692,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
 
   fn scan_export_all_decl(&mut self, decl: &ExportAllDeclaration) {
     let id = self.add_import_record(
-      decl.source.value.as_str(),
+      &to_usv_str(decl.source.value),
       ImportKind::Import,
       decl.source.span(),
       decl.span,
@@ -725,7 +734,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   fn scan_export_from_decl(&mut self, decl: &ExportFromDeclaration<'ast>) {
     let source = &decl.source;
     let record_idx = self.add_import_record(
-      source.value.as_str(),
+      &to_usv_str(source.value),
       ImportKind::Import,
       source.span(),
       decl.span,
@@ -826,8 +835,8 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   fn resolve_symbol_from_reference(&self, id_ref: &IdentifierReference) -> Option<SymbolId> {
     let ref_id = id_ref.reference_id.get().unwrap_or_else(|| {
       panic!(
-        "{id_ref:#?} must have reference id in code```\n{}\n```\n",
-        self.current_stmt_info.unwrap_debug_label()
+        "Identifier `{}` at {}..{} must have a reference id",
+        id_ref.name, id_ref.span.start, id_ref.span.end
       )
     });
     self.result.symbol_ref_db.ast_scopes.symbol_id_for(ref_id)
@@ -901,7 +910,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
 
   fn scan_import_decl(&mut self, decl: &ImportDeclaration) {
     self.scan_esm_import(
-      decl.source.value.as_str(),
+      &to_usv_str(decl.source.value),
       decl.source.span(),
       decl.span,
       decl.node_id(),
@@ -912,7 +921,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
 
   fn scan_lazy_import_decl(&mut self, decl: &ast::LazyImportDeclaration) {
     self.scan_esm_import(
-      decl.source.value.as_str(),
+      &to_usv_str(decl.source.value),
       decl.source.span(),
       decl.span,
       decl.node_id(),
@@ -1085,7 +1094,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
           });
         }
         AstKind::ComputedMemberExpression(expr) => {
-          if let Some(name) = expr.static_property_name() {
+          if let Some(name) = expr.static_property_name().and_then(JSStr::as_str) {
             node_id = ancestor_ast.node_id();
             span = ancestor_ast.span();
             props.push(MemberExprProp {
@@ -1152,9 +1161,10 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   }
 
   pub fn add_constant_symbol(&mut self, symbol_id: SymbolId, value: ConstExportMeta) {
+    let scoping = self.result.symbol_ref_db.scoping();
     let is_mutated = !self.result.symbol_ref_db.is_facade_symbol(symbol_id)
-      && self.result.symbol_ref_db.scoping().symbol_is_mutated(symbol_id);
-    if is_mutated {
+      && scoping.symbol_is_mutated(symbol_id);
+    if is_mutated || eval_can_assign(scoping, symbol_id) {
       return;
     }
     self.result.constant_export_map.insert(symbol_id, value);

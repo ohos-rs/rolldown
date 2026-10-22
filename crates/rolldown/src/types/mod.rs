@@ -6,6 +6,7 @@ pub mod bundle_output;
 pub mod bundler_config;
 pub mod generator;
 pub mod linking_metadata;
+pub mod member_read_star_reexport_path;
 pub mod module_factory;
 pub mod module_source_scan;
 pub mod oxc_parse_type;
