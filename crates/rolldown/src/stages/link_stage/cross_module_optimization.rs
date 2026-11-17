@@ -1,7 +1,6 @@
 use std::cell::Cell;
 
 use oxc::{
-  allocator::GetAllocator,
   ast::{
     AstKind,
     ast::{
@@ -14,7 +13,7 @@ use oxc::{
   semantic::{NodeId, SymbolId},
 };
 use rolldown_common::{
-  AstScopes, ConstExportMeta, EcmaViewMeta, FlatOptions, GetLocalDb, IndexModules,
+  AstScopes, ConstExportMeta, EcmaViewMeta, ExportsKind, FlatOptions, GetLocalDb, IndexModules,
   MemberExprRefResolutionMap, ModuleIdx, SharedNormalizedBundlerOptions, Specifier, StmtEvalFlags,
   StmtInfoIdx, SymbolRef, SymbolRefDb, SymbolRefFlags,
 };
@@ -71,7 +70,8 @@ impl LinkStage<'_> {
 
     #[expect(clippy::bool_to_int_with_if)]
     let other_optimization_pass = if has_side_effect_free_functions { 1 } else { 0 };
-    let cross_module_inline_const_pass = self.options.optimization.inline_const_pass() - 1;
+    let cross_module_inline_const_pass =
+      self.options.optimization.inline_const_pass().saturating_sub(1);
     CrossModuleOptimizationConfig {
       pass: cross_module_inline_const_pass.max(other_optimization_pass),
       inline_const_optimization: cross_module_inline_const_pass >= 1,
@@ -135,6 +135,41 @@ impl LinkStage<'_> {
     // Return all unreachable import expression node IDs instead of add it as a field of LinkStage,
     // Because this set is only used include statement stage.
     unreachable_node_ids
+  }
+
+  /// A JSX element name can't be a literal, so a constant used as one is not inlined.
+  pub(super) fn exclude_jsx_element_names_from_inline_const(&mut self) {
+    if !self.symbols.has_module_preserve_jsx() || self.global_constant_symbol_map.is_empty() {
+      return;
+    }
+    self.global_constant_symbol_map.retain(|symbol_ref, _| {
+      symbol_ref.flags(&self.symbols).is_none_or(|flags| {
+        !flags.intersects(
+          SymbolRefFlags::MustStartWithCapitalLetterForJSX
+            | SymbolRefFlags::UsedAsJSXMemberExprRoot,
+        )
+      })
+    });
+    // An import from a CJS module is not linked to the export, so the flag stays on the import.
+    for meta in &self.metas {
+      for (import_ref, cjs_module_idx) in &meta.named_import_to_cjs_module {
+        let is_jsx_element_name = import_ref.flags(&self.symbols).is_some_and(|flags| {
+          flags.intersects(
+            SymbolRefFlags::MustStartWithCapitalLetterForJSX
+              | SymbolRefFlags::UsedAsJSXMemberExprRoot,
+          )
+        });
+        if is_jsx_element_name
+          && let Some(alias) = &self.symbols.get(*import_ref).namespace_alias
+          && let Some(export) =
+            self.metas[*cjs_module_idx].resolved_exports.get(&alias.property_name)
+        {
+          self
+            .global_constant_symbol_map
+            .remove(&self.symbols.canonical_ref_for(export.symbol_ref));
+        }
+      }
+    }
   }
 
   /// Find all modules that have imports resolving to any of the given constant canonical refs.
@@ -415,7 +450,11 @@ impl<'a, 'ast: 'a> VisitJs<'ast> for CrossModuleOptimizationRunnerContext<'a, 'a
           Some(&self.side_effect_free_call_expr_node_ids),
           Some(self.immutable_ctx.namespace_object_symbol_ids),
           Some(&constants),
-          Some(self.immutable_ctx.eval_ctx.ast.allocator()),
+        )
+        .with_top_level_return_ends_module(
+          !self.immutable_ctx.modules[self.immutable_ctx.module_idx]
+            .as_normal()
+            .is_some_and(|module| matches!(module.exports_kind, ExportsKind::Esm)),
         )
         .analyze_stmt(stmt);
         // Cross-module optimization only refreshes tree-shaking flags. Module-level
@@ -500,10 +539,7 @@ impl<'a, 'ast: 'a> VisitJs<'ast> for CrossModuleOptimizationRunnerContext<'a, 'a
           let symbol_ref: SymbolRef = (self.immutable_ctx.module_idx, binding.symbol_id()).into();
           let local_db = self.immutable_ctx.symbols.local_db(self.immutable_ctx.module_idx);
           // `IsNotReassigned` does not see an assignment inside direct `eval`.
-          let is_not_assigned = local_db
-            .flags
-            .get(&symbol_ref.symbol)
-            .is_some_and(|flag| flag.contains(SymbolRefFlags::IsNotReassigned))
+          let is_not_assigned = symbol_ref.is_not_reassigned(self.immutable_ctx.symbols)
             && !eval_can_assign(local_db.scoping(), symbol_ref.symbol);
 
           if is_not_assigned

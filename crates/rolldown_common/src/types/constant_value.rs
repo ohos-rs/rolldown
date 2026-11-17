@@ -1,6 +1,8 @@
 use num_bigint::BigInt;
-use oxc::{ast::ast::Expression, span::SPAN};
+use oxc::{ast::ast::Expression, semantic::SymbolId, span::SPAN};
 use oxc_ecmascript::constant_evaluation;
+
+use crate::StmtInfoIdx;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum ConstantValue {
@@ -35,38 +37,42 @@ impl ConstExportMeta {
   }
 }
 
-impl From<constant_evaluation::ConstantValue<'_>> for ConstantValue {
-  fn from(value: constant_evaluation::ConstantValue<'_>) -> Self {
+/// An exported root `let` with a literal initializer whose every write is inside a function.
+/// The link stage makes it a constant when no code can call those functions.
+/// See internal-docs/constant-branches/implementation.md.
+#[derive(Debug, Clone)]
+pub struct DeferredWriteConstant {
+  pub symbol: SymbolId,
+  pub meta: ConstExportMeta,
+  /// The top-level statements that contain the writes.
+  pub writer_stmts: Vec<StmtInfoIdx>,
+}
+
+impl<'a> From<&'a ConstantValue> for constant_evaluation::ConstantValue<'a> {
+  fn from(value: &'a ConstantValue) -> Self {
     match value {
-      constant_evaluation::ConstantValue::Number(n) => ConstantValue::Number(n),
-      constant_evaluation::ConstantValue::BigInt(b) => ConstantValue::BigInt(b),
-      constant_evaluation::ConstantValue::String(s) => {
-        ConstantValue::String(s.display().to_string())
-      }
-      constant_evaluation::ConstantValue::Boolean(b) => ConstantValue::Boolean(b),
-      constant_evaluation::ConstantValue::Undefined => ConstantValue::Undefined,
-      constant_evaluation::ConstantValue::Null => ConstantValue::Null,
+      ConstantValue::Number(n) => constant_evaluation::ConstantValue::Number(*n),
+      ConstantValue::BigInt(b) => constant_evaluation::ConstantValue::BigInt(b.clone()),
+      ConstantValue::String(s) => constant_evaluation::ConstantValue::String(s.as_str().into()),
+      ConstantValue::Boolean(b) => constant_evaluation::ConstantValue::Boolean(*b),
+      ConstantValue::Undefined => constant_evaluation::ConstantValue::Undefined,
+      ConstantValue::Null => constant_evaluation::ConstantValue::Null,
     }
   }
 }
 
 impl ConstantValue {
-  /// Convert to oxc's constant value, copying string contents into `allocator` so the
-  /// result borrows from the AST arena for its full lifetime.
-  pub fn to_oxc<'ast>(
-    &self,
-    allocator: &impl oxc::allocator::GetAllocator<'ast>,
-  ) -> constant_evaluation::ConstantValue<'ast> {
-    match self {
-      ConstantValue::Number(n) => constant_evaluation::ConstantValue::Number(*n),
-      ConstantValue::BigInt(b) => constant_evaluation::ConstantValue::BigInt(b.clone()),
-      ConstantValue::String(s) => {
-        constant_evaluation::ConstantValue::String(oxc_str::JSStr::from_str_in(s, allocator))
+  pub fn from_oxc(value: constant_evaluation::ConstantValue<'_>) -> Option<Self> {
+    Some(match value {
+      constant_evaluation::ConstantValue::Number(n) => ConstantValue::Number(n),
+      constant_evaluation::ConstantValue::BigInt(b) => ConstantValue::BigInt(b),
+      constant_evaluation::ConstantValue::String(s) => {
+        ConstantValue::String(s.as_str()?.to_owned())
       }
-      ConstantValue::Boolean(b) => constant_evaluation::ConstantValue::Boolean(*b),
-      ConstantValue::Undefined => constant_evaluation::ConstantValue::Undefined,
-      ConstantValue::Null => constant_evaluation::ConstantValue::Null,
-    }
+      constant_evaluation::ConstantValue::Boolean(b) => ConstantValue::Boolean(b),
+      constant_evaluation::ConstantValue::Undefined => ConstantValue::Undefined,
+      constant_evaluation::ConstantValue::Null => ConstantValue::Null,
+    })
   }
 
   /// Returns the JavaScript type of the value, for oxc's `value_type_for_reference_id` hook.
