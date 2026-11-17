@@ -543,6 +543,16 @@ const CodegenOptionsSchema = v.strictObject({
 isTypeTrue<IsSchemaSubType<typeof CodegenOptionsSchema, CodegenOptions>>();
 
 const MinifyOptionsSchema = v.strictObject({
+  lang: v.optional(
+    v.union([
+      v.literal('js'),
+      v.literal('jsx'),
+      v.literal('ts'),
+      v.literal('tsx'),
+      v.literal('dts'),
+      v.literal('ets-static'),
+    ]),
+  ),
   compress: v.optional(v.union([v.boolean(), CompressOptionsSchema])),
   mangle: v.optional(v.union([v.boolean(), MangleOptionsSchema])),
   mangleProps: v.optional(ManglePropertiesOptionsSchema),
