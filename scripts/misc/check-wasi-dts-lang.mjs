@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // The native declaration is a generated artifact, but the WASI declaration is
-// produced by a separate `just build-rolldown-wasi` run, which normal CI does
-// not perform (it needs the wasi/emnapi SDK). The OHOS fork adds the
-// `ets-static` member to the `lang` unions, and that delta silently drifted out
-// of `rolldown-binding.wasi.d.cts` once. Guard the small part both files must
-// agree on without requiring a WASI toolchain.
+// produced by `just build-rolldown-wasi` in the dedicated WASI lane, which does
+// not check for a dirty tree. The OHOS fork adds the `ets-static` member to the
+// `lang` unions, and that delta silently drifted out of
+// `rolldown-binding.wasi.d.cts` once. Guard the small part both files must
+// agree on in the normal lanes without building the wasm artifact.
 
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
