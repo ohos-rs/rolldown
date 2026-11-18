@@ -12,14 +12,15 @@ use oxc::{
 };
 use oxc_str::{CompactStr, JSStr};
 use rolldown_common::{
-  ConstExportMeta, EcmaModuleAstUsage, EcmaViewMeta, ImportKind, ImportRecordMeta, LocalExport,
-  MemberExprObjectReferencedType, MemberExprRef, RUNTIME_MODULE_KEY, RolldownFileUrlReference,
-  StmtInfoIdx, StmtInfoMeta, SymbolRefFlags, dynamic_import_usage::DynamicImportExportsUsage,
+  ConstExportMeta, EcmaModuleAstUsage, EcmaViewMeta, ImportAttributes, ImportKind,
+  ImportRecordMeta, LocalExport, MemberExprObjectReferencedType, MemberExprRef, RUNTIME_MODULE_KEY,
+  RolldownFileUrlReference, StmtInfoIdx, StmtInfoMeta, SymbolRefFlags,
+  dynamic_import_usage::DynamicImportExportsUsage,
 };
 #[cfg(debug_assertions)]
 use rolldown_ecmascript::ToSourceString;
 use rolldown_ecmascript_utils::{ExpressionExt, is_top_level};
-use rolldown_error::{BuildDiagnostic, EventKindSwitcher};
+use rolldown_error::{BuildDiagnostic, EventKindSwitcher, InvalidImportAttributeKind};
 use rolldown_std_utils::OptionExt;
 use rolldown_utils::ecmascript::to_usv_str;
 
@@ -27,7 +28,8 @@ use crate::{ast_scanner::cjs_export_analyzer::CommonJsAstType, utils};
 
 use super::{
   AstScanner, UntranspiledSyntax, cjs_export_analyzer::CjsGlobalAssignmentType,
-  stmt_eval_analyzer::StmtEvalAnalyzer, top_level_import_read::TopLevelImportReadDetector,
+  early_var_reads::EarlyVarReads, stmt_eval_analyzer::StmtEvalAnalyzer,
+  top_level_import_read::TopLevelImportReadDetector,
 };
 
 impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
@@ -47,10 +49,23 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
 
   fn enter_node(&mut self, kind: oxc::ast::AstKind<'ast>) {
     self.visit_path.push(kind);
+    if is_function_or_class(kind)
+      && let Some(early_var_reads) = &self.early_var_reads
+    {
+      let outermost = (!early_var_reads.is_nested()).then(|| self.outermost_runs_at(kind));
+      if let Some(early_var_reads) = &mut self.early_var_reads {
+        early_var_reads.enter(outermost);
+      }
+    }
   }
 
-  fn leave_node(&mut self, _it: oxc::ast::AstKind<'ast>) {
+  fn leave_node(&mut self, kind: oxc::ast::AstKind<'ast>) {
     self.visit_path.pop();
+    if is_function_or_class(kind)
+      && let Some(early_var_reads) = &mut self.early_var_reads
+    {
+      early_var_reads.leave();
+    }
   }
 
   fn visit_program(&mut self, program: &ast::Program<'ast>) {
@@ -77,6 +92,20 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
       self.result.ecma_view_meta.insert(EcmaViewMeta::IndependentInitialization);
     }
 
+    let scoping = self.result.symbol_ref_db.scoping();
+    if scoping
+      .get_bindings(scoping.root_scope_id())
+      .values()
+      .any(|&symbol_id| scoping.symbol_flags(symbol_id).is_function_scoped_declaration())
+    {
+      self.early_var_reads = Some(EarlyVarReads::default());
+    }
+
+    // With a top-level `return`, a module is CommonJS unless it has an `export` declaration.
+    let top_level_return_ends_module = !program
+      .body
+      .iter()
+      .any(|stmt| stmt.as_module_declaration().is_some_and(ast::ModuleDeclaration::is_export));
     for (idx, stmt) in program.body.iter().enumerate() {
       // `0` is reserved for Module Namespace Object stmt info
       #[expect(
@@ -86,6 +115,7 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
       {
         self.current_stmt_idx = StmtInfoIdx::from_raw_unchecked(idx as u32 + 1);
       }
+      self.current_stmt_start = stmt.span().start;
       let analyzer = StmtEvalAnalyzer::new(
         &self.result.symbol_ref_db.ast_scopes,
         self.immutable_ctx.flat_options,
@@ -95,8 +125,8 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
         // Constants that earlier statements declared. The map grows in statement order, so no read
         // precedes its declaration.
         Some(&self.result.constant_export_map),
-        Some(self.immutable_ctx.allocator),
-      );
+      )
+      .with_top_level_return_ends_module(top_level_return_ends_module);
       let mut stmt_eval_facts = analyzer.analyze_stmt(stmt);
       // `ExecutionOrderSensitive` is read outside the wrap planner too — it gates which leaf
       // modules `sort_chunk_modules` may sort by id — so it has to mean the same thing in every
@@ -115,6 +145,9 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
       }
 
       self.visit_statement(stmt);
+      if self.last_nested_this_stmt_idx != Some(self.current_stmt_idx) {
+        self.mark_functions_never_reading_this(stmt);
+      }
       // Tree-shaking side effects / global reads / pure annotations come from the analyzer.
       // Top-level reads of imported bindings are detected by a separate uniform walk so the
       // signal is complete by construction (no per-expression-form gaps).
@@ -194,6 +227,10 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
     let symbol_id = ident.symbol_id.get().unpack();
     if self.is_root_symbol(symbol_id) {
       self.declare_normal_symbol_ref(symbol_id);
+    } else if let Some(var_id) = self.result.symbol_ref_db.scoping().catch_var_binding(symbol_id)
+      && self.is_root_symbol(var_id)
+    {
+      self.declare_normal_symbol_ref(var_id);
     }
   }
 
@@ -215,6 +252,8 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
     self.process_identifier_ref_by_scope(ident);
     self.try_diagnostic_forbid_const_assign(ident);
     self.update_dynamic_import_binding_usage_info(ident);
+    self.record_root_binding_ref(ident);
+    self.record_root_write(ident);
   }
 
   fn visit_statement(&mut self, stmt: &ast::Statement<'ast>) {
@@ -251,11 +290,19 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
         },
         Some(expr.node_id()),
       );
+      if let Some(options) = &expr.options {
+        self.result.import_records[import_rec_idx].attributes =
+          self.import_attributes_from_import_options(options);
+      }
       self.init_dynamic_import_binding_usage_info(import_rec_idx);
       self.result.imports.insert(expr.node_id(), import_rec_idx);
     } else {
       // No import record - either @vite-ignore or non-static dynamic import
       self.current_stmt_info.meta.insert(StmtInfoMeta::NonStaticDynamicImport);
+      // Its options still reach the output, where a legacy `assert` key becomes `with`.
+      if let Some(span) = expr.options.as_ref().and_then(assert_key_span) {
+        self.warn_deprecated_import_assertion(span);
+      }
     }
     walk_js::walk_import_expression(self, expr);
   }
@@ -271,7 +318,7 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
             self.cjs_module_ident.get_or_insert(Span::new(id.span.start, id.span.start + 6));
             // `module.exports = <value>` replaces the entire exports object,
             // so all prior `exports.xxx` constants are stale.
-            self.has_module_exports_reassignment = true;
+            self.has_cjs_exports_reassignment = true;
           }
           if id.name == "exports" && self.is_global_identifier_reference(id) {
             self.cjs_exports_ident.get_or_insert(Span::new(id.span.start, id.span.start + 7));
@@ -287,7 +334,12 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
 
               self.declare_link_only_symbol_ref(exported_symbol.symbol);
 
-              if let Some(value) = self.extract_constant_value_from_expr(Some(&node.right)) {
+              // Only an unconditional `=` assigns the RHS value to `exports.test`.
+              // Compound and logical assignments also depend on its previous value.
+              if node.operator == ast::AssignmentOperator::Assign
+                && self.is_unconditional_module_level_expr()
+                && let Some(value) = self.extract_constant_value_from_expr(Some(&node.right))
+              {
                 self.add_constant_symbol(exported_symbol.symbol, ConstExportMeta::new(value, true));
               }
 
@@ -330,6 +382,9 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
   /// Deliberately not folded into `visit_import_meta`: that method returns early when
   /// `keep_esm_import_export_syntax()` is set, but `ROLLDOWN_FILE_URL_` is rewritten
   /// regardless of that option.
+  ///
+  /// Returning keeps the inner `import.meta` from setting `ImportMeta`, so inline common chunks can
+  /// copy the module: each copy gets its own replacement, resolved for the file that prints it.
   fn visit_member_expression(&mut self, it: &ast::MemberExpression<'ast>) {
     if it.object().is_import_meta()
       && let Some(property_name) = it.static_property_name().and_then(JSStr::as_str)
@@ -341,11 +396,14 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
         reference_id: CompactStr::from(file_url.reference_id),
         url_id: file_url.url_id.map(CompactStr::from),
       });
+      return;
     }
     walk_js::walk_member_expression(self, it);
   }
   fn visit_this_expression(&mut self, it: &ast::ThisExpression) {
-    if !self.is_this_nested() {
+    if self.is_this_nested() {
+      self.last_nested_this_stmt_idx = Some(self.current_stmt_idx);
+    } else {
       self.top_level_this_expr_set.insert(it.node_id());
     }
     walk_js::walk_this_expression(self, it);
@@ -377,6 +435,12 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
     // `var` in a nested statement also declares a root binding, but its initializer can be skipped.
     if matches!(self.visit_path.as_slice(), [] | [AstKind::ExportDeclaration(_)]) {
       for declarator in &decl.declarations {
+        if decl.kind == ast::VariableDeclarationKind::Var
+          && let BindingPattern::BindingIdentifier(binding) = &declarator.id
+          && let Some(early_var_reads) = &mut self.early_var_reads
+        {
+          early_var_reads.add_var_declarator(binding.symbol_id(), declarator.span.end);
+        }
         if let (BindingPattern::BindingIdentifier(binding), Some(init)) =
           (&declarator.id, &declarator.init)
           && let Some(value) = self.extract_constant_value_from_expr(Some(init))
@@ -403,6 +467,11 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
   }
 
   fn visit_expression(&mut self, it: &Expression<'ast>) {
+    // Exactly the expressions `rewrite_import_meta_hot` rewrites. Returning keeps the inner
+    // `import.meta` from setting `ImportMeta`; the expression has nothing else to scan.
+    if it.is_import_meta_hot() && self.immutable_ctx.options.is_dev_mode_enabled() {
+      return;
+    }
     if matches!(it, Expression::ImportMeta(_)) {
       self.current_stmt_info.meta.insert(StmtInfoMeta::ImportMeta);
     }
@@ -472,17 +541,15 @@ impl<'me, 'ast: 'me> VisitJs<'ast> for AstScanner<'me, 'ast> {
 impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   fn handle_top_level_await(&mut self, span: Span) {
     if !self.immutable_ctx.flat_options.keep_esm_import_export_syntax() {
-      self.result.errors.push(BuildDiagnostic::unsupported_feature(
+      self.result.errors.push(BuildDiagnostic::invalid_tla_format(
         self.immutable_ctx.id.as_arc_str().clone(),
         self.immutable_ctx.source.clone(),
         span,
-        format!(
-          "Top-level await is currently not supported with the '{format}' output format",
-          format = self.immutable_ctx.options.format
-        ),
+        self.immutable_ctx.options.format.as_str().into(),
       ));
     }
     self.result.ast_usage.insert(EcmaModuleAstUsage::TopLevelAwait);
+    self.current_stmt_info.meta.insert(StmtInfoMeta::TopLevelAwait);
     if self.result.tla_keyword_span.is_none() {
       self.result.tla_keyword_span = Some(span);
     }
@@ -496,6 +563,43 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
     Some(symbol_id)
   }
 
+  /// Returns whether the expression being visited runs whenever its module runs: no top-level
+  /// `return` comes before it, and it is the expression of a module-level statement, nested only in
+  /// sequences, parentheses and assignments that always evaluate their right side.
+  fn is_unconditional_module_level_expr(&self) -> bool {
+    if self.result.ast_usage.contains(EcmaModuleAstUsage::TopLevelReturn) {
+      return false;
+    }
+    let [AstKind::ExpressionStatement(_), rest @ ..] = self.visit_path.as_slice() else {
+      return false;
+    };
+    rest.iter().all(|kind| match kind {
+      AstKind::AssignmentExpression(assignment) => !assignment.operator.is_logical(),
+      AstKind::SequenceExpression(_) | AstKind::ParenthesizedExpression(_) => true,
+      _ => false,
+    })
+  }
+
+  /// Records a reference to a root variable or function for finding `var`s read before their
+  /// declarator runs. `export { x }` only forwards the binding.
+  fn record_root_binding_ref(&mut self, ident_ref: &IdentifierReference) {
+    if self.early_var_reads.is_none()
+      || matches!(self.visit_path.last(), Some(AstKind::ExportSpecifier(_)))
+    {
+      return;
+    }
+    let Some(symbol_id) = self.resolve_symbol_from_reference(ident_ref) else {
+      return;
+    };
+    let flags = self.result.symbol_ref_db.scoping().symbol_flags(symbol_id);
+    if self.is_root_symbol(symbol_id)
+      && (flags.is_variable() || flags.is_function())
+      && let Some(early_var_reads) = &mut self.early_var_reads
+    {
+      early_var_reads.add_ref(symbol_id, ident_ref.span.start);
+    }
+  }
+
   fn process_identifier_ref_by_scope(&mut self, ident_ref: &IdentifierReference) {
     match self.resolve_identifier_reference(ident_ref) {
       super::IdentifierReferenceKind::Global => {
@@ -507,10 +611,24 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
               CjsGlobalAssignmentType::ModuleExportsAssignment,
             );
             self.update_ast_usage_for_commonjs_export(v.as_ref());
+            // `module.exports.test = ...` writes the same property as `exports.test = ...`.
+            if let Some(CommonJsAstType::ExportsPropWrite(prop)) = v {
+              self.cjs_named_exports_usage.entry(prop).or_default().write += 1;
+            }
           }
           "exports" => {
             self.result.ast_usage.insert(EcmaModuleAstUsage::ExportsRef);
-            // exports = {} will not change the module.exports object, so we just ignore it;
+            // A write to the binding can detach it from `module.exports`, including
+            // destructuring and loop targets. Property writes only read the binding.
+            if self
+              .result
+              .symbol_ref_db
+              .scoping()
+              .get_reference(ident_ref.reference_id())
+              .is_write()
+            {
+              self.has_cjs_exports_reassignment = true;
+            }
             let v =
               self.commonjs_export_analyzer(ident_ref, CjsGlobalAssignmentType::ExportsAssignment);
             self.update_ast_usage_for_commonjs_export(v.as_ref());
@@ -540,7 +658,9 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
           }
           "require" => {
             let is_dummy_record = match self.visit_path.last() {
-              Some(AstKind::CallExpression(call_expr)) => {
+              Some(AstKind::CallExpression(call_expr))
+                if call_expr.callee.node_id() == ident_ref.node_id() =>
+              {
                 !self.process_global_require_call(call_expr)
               }
               Some(_) => true,
@@ -579,10 +699,28 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
             }
             rolldown_common::Specifier::Literal(_) => MemberExprObjectReferencedType::Named,
           };
-          // Record the whole chain for every import kind: a default or named import can resolve
-          // to a namespace (`export * as default from`), and the link stage resolves and shims
-          // missing exports through each nested namespace in the chain.
-          if let Some((node_id, span, props)) =
+          let in_operator_key = if matches!(ty, MemberExprObjectReferencedType::Namespace) {
+            self.try_extract_parent_in_operator_key()
+          } else {
+            None
+          };
+          if let Some((node_id, span, key)) = in_operator_key {
+            is_inserted_before = true;
+            self.result.namespace_in_checks.insert(node_id, key);
+            self.add_member_expr_reference(MemberExprRef {
+              object_ref: root_symbol_id,
+              prop_and_span_list: vec![],
+              node_id,
+              span,
+              object_ref_type: ty,
+              reference_id: ident_ref.reference_id.get(),
+              is_write: false,
+              write_target: None,
+            });
+          } else if let Some((node_id, span, props)) =
+            // Record the whole chain for every import kind: a default or named import can resolve
+            // to a namespace (`export * as default from`), and the link stage resolves and shims
+            // missing exports through each nested namespace in the chain.
             self.try_extract_parent_static_member_expr_chain(usize::MAX)
           {
             if !span.is_unspanned() {
@@ -802,4 +940,96 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   fn visit_jsx_closing_element_for_jsx_preserve(&mut self, elem: &JSXClosingElement<'ast>) {
     self.mark_jsx_member_expression_root(&elem.name);
   }
+
+  /// `{ type: 'json' }` in `import('./data.json', { with: { type: 'json' } })`. Like Rollup, only
+  /// statically known string attributes count. The legacy `assert` key is read like `with` and
+  /// warns. Ignored options warn only with `experimental.importAttributes`.
+  fn import_attributes_from_import_options(&mut self, options: &Expression) -> ImportAttributes {
+    let Expression::ObjectExpression(options) = options else {
+      self.warn_invalid_import_attribute(
+        InvalidImportAttributeKind::DynamicImportOptions,
+        options.span(),
+      );
+      return ImportAttributes::default();
+    };
+    let Some((keyword, with)) = options.properties.iter().find_map(|property| {
+      let ast::ObjectPropertyKind::ObjectProperty(property) = property else { return None };
+      let name = property.key.static_name().filter(|_| !property.computed)?;
+      (name == "with" || name == "assert").then_some((name, property))
+    }) else {
+      return ImportAttributes::default();
+    };
+    if keyword == "assert" {
+      self.warn_deprecated_import_assertion(with.key.span());
+    }
+    let Expression::ObjectExpression(with) = &with.value else {
+      self.warn_invalid_import_attribute(
+        InvalidImportAttributeKind::DynamicImportOptions,
+        with.value.span(),
+      );
+      return ImportAttributes::default();
+    };
+    // An object literal may repeat a key, and the later one wins, as in JS.
+    ImportAttributes::from_entries(with.properties.iter().filter_map(|property| {
+      let entry = match property {
+        ast::ObjectPropertyKind::ObjectProperty(property) => match &property.value {
+          // Lone surrogates become U+FFFD, like in a static `with` clause.
+          Expression::StringLiteral(value) => property
+            .key
+            .static_name()
+            .filter(|_| !property.computed)
+            .map(|key| (CompactStr::from(to_usv_str(key.as_js_str())), to_usv_str(value.value))),
+          _ => None,
+        },
+        ast::ObjectPropertyKind::SpreadProperty(_) => None,
+      };
+      if entry.is_none() {
+        self.warn_invalid_import_attribute(
+          InvalidImportAttributeKind::DynamicImportAttribute,
+          property.span(),
+        );
+      }
+      entry
+    }))
+  }
+
+  fn warn_deprecated_import_assertion(&mut self, span: Span) {
+    let ctx = &self.immutable_ctx;
+    if ctx.options.checks.contains(EventKindSwitcher::DeprecatedImportAssertion) {
+      self.result.warnings.push(
+        BuildDiagnostic::deprecated_import_assertion(ctx.id.to_string(), ctx.source.clone(), span)
+          .with_severity_warning(),
+      );
+    }
+  }
+
+  fn warn_invalid_import_attribute(&mut self, kind: InvalidImportAttributeKind, span: Span) {
+    let ctx = &self.immutable_ctx;
+    if ctx.options.experimental.is_import_attributes_enabled()
+      && ctx.options.checks.contains(EventKindSwitcher::InvalidImportAttribute)
+    {
+      self.result.warnings.push(
+        BuildDiagnostic::invalid_import_attribute(
+          ctx.id.to_string(),
+          ctx.source.clone(),
+          span,
+          kind,
+        )
+        .with_severity_warning(),
+      );
+    }
+  }
+}
+
+/// The span of a legacy `assert` key in the options of `import()`.
+fn assert_key_span(options: &Expression) -> Option<Span> {
+  let Expression::ObjectExpression(options) = options else { return None };
+  options.properties.iter().find_map(|property| {
+    let ast::ObjectPropertyKind::ObjectProperty(property) = property else { return None };
+    (!property.computed && property.key.static_name()? == "assert").then(|| property.key.span())
+  })
+}
+
+fn is_function_or_class(kind: AstKind) -> bool {
+  matches!(kind, AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) | AstKind::Class(_))
 }
