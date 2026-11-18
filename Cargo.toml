@@ -275,7 +275,7 @@ napi = { version = "3", features = ["async", "anyhow", "tracing", "object_indexm
 napi-build = { version = "2" }
 napi-derive = { version = "3", default-features = false, features = ["type-def", "tracing"] }
 
-# oxc crates from ohos-rs/oxc `sync/upstream-main-20261117` (0.159.0 + ArkTS/ETS).
+# oxc crates from ohos-rs/oxc `ohos` (0.159.0 + ArkTS/ETS), merged via ohos-rs/oxc#7.
 # Pinned to https://github.com/ohos-rs/oxc/commit/b4e750867f5a919c444d48f31b005725962be018
 oxc = { git = "https://github.com/ohos-rs/oxc.git", rev = "b4e750867f5a919c444d48f31b005725962be018", features = [
   "ast_visit",
